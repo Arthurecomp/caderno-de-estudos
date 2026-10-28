@@ -1,7 +1,7 @@
 /* ==========================================================================
    CADERNO DE ESTUDOS — script.js
    Etapa 1/5: estrutura, IndexedDB, navegação, CRUD de assuntos, tema.
-   (Materiais, Questões, Anotações, Pesquisa e Backup vêm nas próximas etapas)
+   (Materiais, Questões, Pesquisa e Backup vêm nas próximas etapas)
    ========================================================================== */
 
 /* ============================================================
@@ -9,7 +9,7 @@
    ============================================================ */
 
 const DB_NAME = "caderno_estudos_db";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 
 // Matérias do roteiro da POLÍCIA MILITAR (ids originais, não mudar)
 const MATERIAS_PM = [
@@ -34,13 +34,17 @@ const state = {
   currentTab: "materiais",
   currentPagina: 1,
   objectURLs: [], // URLs de imagens criadas com createObjectURL, para revogar depois
-  filtros: { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" },
+  filtros: { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" },
   respostasVisiveis: new Map(), // id da questão -> true/false (resposta e comentários visíveis)
   ordem: "sequencial",          // "sequencial" (ordem em que foram inseridas) ou "aleatoria"
   ordemAleatoria: null,         // lista de ids na ordem embaralhada atual
+  desempPeriodo: "hoje",        // painel de desempenho: hoje | ontem | 7d | 30d | tudo | data
+  desempData: "",               // "AAAA-MM-DD" quando o período é uma data específica
+  desempOrdem: "assunto",       // assunto | pior | melhor | mais
+  desempAba: "questoes",        // painel de desempenho: questoes | flash
 };
 
-const QUESTOES_POR_PAGINA = 10;
+const QUESTOES_POR_PAGINA = 20;
 
 // Dias da semana no índice do Date.getDay() (0 = Domingo ... 6 = Sábado)
 const DIAS_SEMANA = ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"];
@@ -278,6 +282,11 @@ const CONCURSOS_PADRAO = [
   { id: "pc", nome: "Polícia Civil",   icone: "🚓", materias: MATERIAS_PC, topicos: TOPICOS_PC, assuntos: true },
 ];
 
+// Data da prova de cada roteiro (AAAA-MM-DD). Para mudar ou incluir outra, edite aqui.
+const DATAS_PROVA = {
+  pm: "2027-02-21",   // PMPE
+};
+
 // cores sugeridas para matérias criadas manualmente
 const PALETA_CORES = ["#7C5CFC", "#C98A1A", "#2F9E6E", "#2F80ED", "#E0403F", "#B84DCC", "#E07B39", "#16A5A5", "#8A6D3B", "#D6457A"];
 
@@ -334,6 +343,11 @@ function openDatabase() {
       // cronograma: matérias atribuídas a cada dia da semana (0=Domingo ... 6=Sábado)
       if (!db.objectStoreNames.contains("cronograma")) {
         db.createObjectStore("cronograma", { keyPath: "dia" });
+      }
+
+      // agenda: assuntos que o usuário agenda para cada dia do calendário (id = "roteiro|AAAA-MM-DD")
+      if (!db.objectStoreNames.contains("agenda")) {
+        db.createObjectStore("agenda", { keyPath: "id" });
       }
 
       // concursos: roteiros separados (PM, PC...), cada um com suas matérias
@@ -467,12 +481,33 @@ function escapeHTML(str) {
   return div.innerHTML;
 }
 
+/* ---------- formatação simples nos textos (negrito, itálico, destaque) ----------
+   O texto continua sendo guardado como texto puro, com marcas:
+     **negrito**   *itálico*   ==destaque==
+   Dá para digitar as marcas ou usar a barra B / I / destaque (atalhos Ctrl+B e Ctrl+I). */
+function formatarTextoRico(texto) {
+  let h = escapeHTML(texto);
+  h = h.replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, "<strong>$1</strong>");
+  h = h.replace(/==(?=\S)([\s\S]*?\S)==/g, "<mark>$1</mark>");
+  h = h.replace(/\*(?=[^\s<>])([^*\n<>]*?[^\s<>])\*/g, "<em>$1</em>");
+  return h;
+}
+
+// tira as marcas (para PDF e trechos de pesquisa)
+function semMarcacao(texto) {
+  return String(texto ?? "")
+    .replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, "$1")
+    .replace(/==(?=\S)([\s\S]*?\S)==/g, "$1")
+    .replace(/\*(?=\S)([^*\n]*?\S)\*/g, "$1");
+}
+
 /* ============================================================
    4. NAVEGAÇÃO ENTRE TELAS
    ============================================================ */
 
 function showView(viewId) {
   if (viewId !== "view-assunto" && typeof fecharPlayerAudio === "function") fecharPlayerAudio(); // para o áudio ao sair do assunto
+  if (viewId !== "view-assunto" && typeof sessaoEstudoSair === "function") sessaoEstudoSair(); // pausa o cronômetro ao sair do assunto
   document.querySelectorAll(".view").forEach(v => v.hidden = true);
   document.getElementById(viewId).hidden = false;
 
@@ -481,7 +516,10 @@ function showView(viewId) {
 }
 
 document.getElementById("btn-voltar").addEventListener("click", () => {
-  if (!document.getElementById("view-assunto").hidden) {
+  if (!document.getElementById("view-desempenho").hidden) {
+    // volta do painel de desempenho para a lista de assuntos da matéria
+    goToMateria(state.currentMateriaId);
+  } else if (!document.getElementById("view-assunto").hidden) {
     // volta da tela de assunto para a lista de assuntos da matéria
     document.getElementById("app-title").textContent = "📘 Caderno de Estudos";
     goToMateria(state.currentMateriaId);
@@ -523,10 +561,11 @@ document.getElementById("btn-roteiro").addEventListener("click", goToRoteiro);
 async function goToAssunto(assuntoId) {
   state.currentAssuntoId = assuntoId;
   state.currentPagina = 1;
-  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
   const assunto = await dbGet("assuntos", assuntoId);
   document.getElementById("app-title").textContent = `📄 ${assunto.nome}`;
   showView("view-assunto");
+  sessaoEstudoEntrar(assuntoId);
   setActiveTab("materiais");
 }
 
@@ -568,6 +607,7 @@ async function getMateriaStats(materiaId) {
 async function renderHome() {
   renderConcursoBar();
   await renderRoteiroBanner();
+  renderPlanoHoje().catch(err => console.error("Erro ao montar a sugestão de hoje:", err));
 
   const grid = document.getElementById("materias-grid");
   grid.innerHTML = "";
@@ -763,7 +803,7 @@ function confirmDeleteAssunto(assunto) {
   openModal(`
     <h3 class="modal-title">Excluir "${escapeHTML(assunto.nome)}"?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Isso também excluirá todos os PDFs, questões, flashcards e anotações deste assunto. Essa ação não pode ser desfeita.
+      Isso também excluirá todos os PDFs, questões e flashcards deste assunto. Essa ação não pode ser desfeita.
     </p>
     <div class="modal-actions">
       <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
@@ -794,6 +834,387 @@ async function deleteAssuntoCascade(assuntoId) {
 }
 
 /* ============================================================
+   6B. DESEMPENHO DA MATÉRIA — acertos e erros por assunto e por dia
+   Usa o histórico que já existe em questao.tentativas = [{ em, acertou }].
+   ============================================================ */
+
+document.getElementById("btn-desempenho").addEventListener("click", () => {
+  if (state.currentMateriaId) goToDesempenho(state.currentMateriaId);
+});
+
+async function goToDesempenho(materiaId) {
+  const materia = getMateriaById(materiaId);
+  if (!materia) { goToHome(); return; }
+  state.currentMateriaId = materiaId;
+  state.currentAssuntoId = null;
+  document.getElementById("app-title").textContent = `📊 Desempenho — ${materia.nome}`;
+  showView("view-desempenho");
+  await renderDesempenho(materiaId);
+}
+
+// "AAAA-MM-DD" no fuso local
+function chaveDia(ts) {
+  const d = new Date(ts);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+function intervaloDesempenho() {
+  const p = state.desempPeriodo;
+  if (p === "hoje") return [inicioDoDia(0), inicioDoDia(1)];
+  if (p === "ontem") return [inicioDoDia(-1), inicioDoDia(0)];
+  if (p === "7d") return [inicioDoDia(-6), inicioDoDia(1)];
+  if (p === "30d") return [inicioDoDia(-29), inicioDoDia(1)];
+  if (p === "data" && state.desempData) {
+    const [a, m, d] = state.desempData.split("-").map(Number);
+    return [new Date(a, m - 1, d).getTime(), new Date(a, m - 1, d + 1).getTime()];
+  }
+  return [0, Infinity];
+}
+
+function rotuloPeriodoDesempenho() {
+  const fmt = (ts) => new Date(ts).toLocaleDateString("pt-BR");
+  const p = state.desempPeriodo;
+  if (p === "hoje") return `Hoje (${fmt(inicioDoDia(0))})`;
+  if (p === "ontem") return `Ontem (${fmt(inicioDoDia(-1))})`;
+  if (p === "7d") return `Últimos 7 dias (${fmt(inicioDoDia(-6))} a ${fmt(inicioDoDia(0))})`;
+  if (p === "30d") return `Últimos 30 dias (${fmt(inicioDoDia(-29))} a ${fmt(inicioDoDia(0))})`;
+  if (p === "data" && state.desempData) {
+    const [a, m, d] = state.desempData.split("-").map(Number);
+    return fmt(new Date(a, m - 1, d).getTime());
+  }
+  return "Todo o período";
+}
+
+function classeTaxa(taxa) {
+  if (taxa === null) return "";
+  if (taxa >= 70) return "taxa-boa";
+  if (taxa >= 50) return "taxa-media";
+  return "taxa-ruim";
+}
+
+// ---------- coleta de atividade: questões (tentativas) + flashcards (revisões) ----------
+function revisoesDoFlashcard(f) {
+  if (Array.isArray(f.historico) && f.historico.length) return f.historico.filter(h => typeof h.em === "number");
+  // cartão antigo (antes do histórico): só sabemos a última revisão
+  if (typeof f.ultimaRevisao === "number") return [{ em: f.ultimaRevisao, nota: null }];
+  return [];
+}
+
+// uma "unidade" por assunto da matéria: { id, nome, assuntoId, tent: [...], revs: [...] }
+async function coletarUnidadesDaMateria(materiaId) {
+  const assuntos = await dbGetAll("assuntos", "materiaId", materiaId);
+  assuntos.sort((a, b) => (a.ordem ?? 0) - (b.ordem ?? 0));
+  const unidades = [];
+  for (const a of assuntos) {
+    const questoes = await dbGetAll("questoes", "assuntoId", a.id);
+    const cards = await dbGetAll("flashcards", "assuntoId", a.id);
+    const tent = [];
+    for (const q of questoes) for (const t of (q.tentativas || [])) if (typeof t.em === "number") tent.push(t);
+    const revs = [];
+    for (const f of cards) revs.push(...revisoesDoFlashcard(f));
+    unidades.push({ id: a.id, nome: a.nome, assuntoId: a.id, tent, revs });
+  }
+  return unidades;
+}
+
+// uma "unidade" por matéria do roteiro atual (soma de todos os assuntos)
+async function coletarUnidadesPorMateria() {
+  const unidades = [];
+  for (const m of MATERIAS) {
+    const subs = await coletarUnidadesDaMateria(m.id);
+    unidades.push({
+      id: m.id, materiaId: m.id, nome: `${m.icone} ${m.nome}`,
+      tent: subs.flatMap(u => u.tent),
+      revs: subs.flatMap(u => u.revs),
+    });
+  }
+  return unidades;
+}
+
+async function renderDesempenho(materiaId) {
+  const el = document.getElementById("desempenho-container");
+  const unidades = await coletarUnidadesDaMateria(materiaId);
+  montarPainelDesempenho(el, unidades, {
+    rotuloUnidade: "Assunto",
+    mostrarZeros: false,
+    vazioHTML: `
+      <div class="empty-state">
+        <span class="empty-emoji">📊</span>
+        <p>Ainda não há questões respondidas nem flashcards revisados nesta matéria.</p>
+        <p>Nas questões, clique em "Acertei" ou "Errei"; nos flashcards, faça uma revisão para o desempenho aparecer aqui.</p>
+      </div>`,
+    dicaQuestoes: "Abrir as questões deste assunto",
+    dicaFlash: "Abrir os flashcards deste assunto",
+    rerender: () => renderDesempenho(materiaId),
+    aoClicar: async (u, tipo) => {
+      await goToAssunto(u.assuntoId);
+      setActiveTab(tipo === "flash" ? "flashcards" : "questoes");
+    },
+  });
+}
+
+/* ---------- DESEMPENHO GERAL (todas as matérias do roteiro atual) ---------- */
+document.getElementById("btn-desempenho-geral").addEventListener("click", goToDesempenhoGeral);
+
+async function goToDesempenhoGeral() {
+  if (!getConcursoAtual() || MATERIAS.length === 0) {
+    showToast("Este roteiro ainda não tem matérias.");
+    return;
+  }
+  state.currentMateriaId = null;
+  state.currentAssuntoId = null;
+  const c = getConcursoAtual();
+  document.getElementById("app-title").textContent = `📊 Desempenho geral — ${c.nome}`;
+  showView("view-desempenho");
+  await renderDesempenhoGeral();
+}
+
+async function renderDesempenhoGeral() {
+  const el = document.getElementById("desempenho-container");
+  const unidades = await coletarUnidadesPorMateria();
+  montarPainelDesempenho(el, unidades, {
+    rotuloUnidade: "Matéria",
+    mostrarZeros: true, // mostra também as matérias sem atividade, para ver onde falta estudar
+    vazioHTML: `
+      <div class="empty-state">
+        <span class="empty-emoji">📊</span>
+        <p>Ainda não há questões respondidas nem flashcards revisados neste roteiro.</p>
+        <p>Assim que você estudar, o desempenho de todas as matérias aparece aqui.</p>
+      </div>`,
+    dicaQuestoes: "Ver o desempenho desta matéria",
+    dicaFlash: "Ver o desempenho desta matéria",
+    rerender: renderDesempenhoGeral,
+    aoClicar: (u) => goToDesempenho(u.materiaId),
+  });
+}
+
+/* ---------- painel compartilhado (matéria e geral), com abas Questões / Flashcards ---------- */
+function montarPainelDesempenho(el, unidadesTodas, cfg) {
+  const aba = state.desempAba === "flash" ? "flash" : "questoes";
+  const ehFlash = aba === "flash";
+
+  // só os dados da aba escolhida: tudo abaixo (cards, faixa de dias, tabela) usa apenas eles
+  const unidades = unidadesTodas.map(u => ({ ...u, tent: ehFlash ? [] : u.tent, revs: ehFlash ? u.revs : [] }));
+
+  const abasHTML = `
+    <div class="tabs-bar desemp-abas">
+      <button class="desemp-aba ${!ehFlash ? "active" : ""}" data-aba="questoes">❓ Questões</button>
+      <button class="desemp-aba ${ehFlash ? "active" : ""}" data-aba="flash">🃏 Flashcards</button>
+    </div>`;
+
+  const ligarAbas = () => {
+    el.querySelectorAll(".desemp-aba").forEach(btn => {
+      btn.addEventListener("click", () => {
+        if (state.desempAba === btn.dataset.aba) return;
+        state.desempAba = btn.dataset.aba;
+        cfg.rerender();
+      });
+    });
+  };
+
+  // atividade por dia na aba escolhida: n = itens, ok = acertos / lembrados
+  const dias = new Map(); // "AAAA-MM-DD" -> { n, ok }
+  const doDia = (k) => {
+    let o = dias.get(k);
+    if (!o) { o = { n: 0, ok: 0 }; dias.set(k, o); }
+    return o;
+  };
+  for (const u of unidades) {
+    for (const t of u.tent) { const o = doDia(chaveDia(t.em)); o.n++; if (t.acertou) o.ok++; }
+    for (const r of u.revs) { const o = doDia(chaveDia(r.em)); o.n++; if (r.nota && r.nota !== "errei") o.ok++; }
+  }
+
+  if (dias.size === 0) {
+    el.innerHTML = abasHTML + (ehFlash ? `
+      <div class="empty-state">
+        <span class="empty-emoji">🃏</span>
+        <p>Ainda não há flashcards revisados ${cfg.rotuloUnidade === "Matéria" ? "neste roteiro" : "nesta matéria"}.</p>
+        <p>Faça uma revisão na aba Flashcards de um assunto para o desempenho aparecer aqui.</p>
+      </div>` : `
+      <div class="empty-state">
+        <span class="empty-emoji">❓</span>
+        <p>Ainda não há questões respondidas ${cfg.rotuloUnidade === "Matéria" ? "neste roteiro" : "nesta matéria"}.</p>
+        <p>Nas questões, clique em "Acertei" ou "Errei" para o desempenho aparecer aqui.</p>
+      </div>`);
+    ligarAbas();
+    return;
+  }
+
+  // ---- números do período escolhido ----
+  const [ini, fim] = intervaloDesempenho();
+  const noPeriodo = (x) => x.em >= ini && x.em < fim;
+  const linhas = unidades.map(u => {
+    if (!ehFlash) {
+      const tp = u.tent.filter(noPeriodo);
+      const ac = tp.filter(t => t.acertou).length;
+      return { u, total: tp.length, acertos: ac, erros: tp.length - ac, semNota: 0, taxa: tp.length ? Math.round((ac / tp.length) * 100) : null };
+    }
+    const rp = u.revs.filter(noPeriodo);
+    const err = rp.filter(r => r.nota === "errei").length;
+    const ok = rp.filter(r => r.nota && r.nota !== "errei").length;
+    const den = ok + err;
+    return { u, total: rp.length, acertos: ok, erros: err, semNota: rp.length - den, taxa: den ? Math.round((ok / den) * 100) : null };
+  });
+  const soma = (campo) => linhas.reduce((n, l) => n + l[campo], 0);
+  const total = soma("total"), acertos = soma("acertos"), erros = soma("erros"), semNota = soma("semNota");
+  const den = ehFlash ? acertos + erros : total;
+  const taxaGeral = den ? Math.round((acertos / den) * 100) : null;
+
+  const ordem = state.desempOrdem;
+  let lista = cfg.mostrarZeros ? linhas.slice() : linhas.filter(l => l.total > 0);
+  const ocultas = linhas.length - lista.length;
+  if (ordem === "pior") lista.sort((a, b) => (a.taxa ?? 101) - (b.taxa ?? 101) || b.total - a.total);
+  else if (ordem === "melhor") lista.sort((a, b) => (b.taxa ?? -1) - (a.taxa ?? -1) || b.total - a.total);
+  else if (ordem === "mais") lista.sort((a, b) => b.total - a.total);
+  // "assunto" mantém a ordem do cadastro
+
+  // ---- sequência de dias estudando (na aba escolhida) ----
+  let sequencia = 0;
+  const cursor = new Date();
+  cursor.setHours(0, 0, 0, 0);
+  if (!dias.has(chaveDia(cursor.getTime()))) cursor.setDate(cursor.getDate() - 1);
+  while (dias.has(chaveDia(cursor.getTime()))) {
+    sequencia++;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  // ---- faixa dos últimos 14 dias ----
+  const nivel = (n) => (n === 0 ? 0 : n < 5 ? 1 : n < 10 ? 2 : n < 20 ? 3 : 4);
+  let faixaHTML = "";
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - i);
+    const k = chaveDia(d.getTime());
+    const info = dias.get(k) || { n: 0, ok: 0 };
+    const selecionado = state.desempPeriodo === "data" && state.desempData === k;
+    const dica = info.n
+      ? (ehFlash
+          ? `${d.toLocaleDateString("pt-BR")}: ${info.n} flashcard(s) revisado(s)`
+          : `${d.toLocaleDateString("pt-BR")}: ${info.n} respondida(s) — ${info.ok} acerto(s), ${info.n - info.ok} erro(s)`)
+      : `${d.toLocaleDateString("pt-BR")}: nenhuma atividade`;
+    faixaHTML += `
+      <button class="desemp-dia nivel-${nivel(info.n)} ${selecionado ? "selecionado" : ""}" data-dia="${k}" title="${dica}">
+        <span class="desemp-dia-sem">${DIAS_SEMANA[d.getDay()].slice(0, 3)}</span>
+        <span class="desemp-dia-num">${d.getDate()}</span>
+        <span class="desemp-dia-qtd">${info.n || "·"}</span>
+      </button>`;
+  }
+
+  const pills = [["hoje", "Hoje"], ["ontem", "Ontem"], ["7d", "7 dias"], ["30d", "30 dias"], ["tudo", "Tudo"]]
+    .map(([v, t]) => `<button class="pagina-pill desemp-pill ${state.desempPeriodo === v ? "active" : ""}" data-periodo="${v}">${t}</button>`)
+    .join("");
+
+  const barra = (taxa) => taxa === null
+    ? `<span class="desemp-barra"></span><b>—</b>`
+    : `<span class="desemp-barra"><span class="desemp-barra-ok" style="width:${taxa}%"></span></span><b>${taxa}%</b>`;
+
+  const linhaHTML = (l) => `
+    <div class="desemp-linha ${l.total === 0 ? "desemp-linha-vazia" : ""}" data-unidade="${l.u.id}" data-tipo="${aba}" title="${escapeHTML(ehFlash ? cfg.dicaFlash : cfg.dicaQuestoes)}">
+      <span class="desemp-nome">${escapeHTML(l.u.nome)}</span>
+      <span class="desemp-num">${l.total}</span>
+      <span class="desemp-num desemp-acerto">${l.acertos}</span>
+      <span class="desemp-num desemp-erro">${l.erros}</span>
+      <span class="desemp-taxa ${classeTaxa(l.taxa)}">${barra(l.taxa)}</span>
+    </div>`;
+
+  const cab = ehFlash ? ["Revis.", "Lembrei", "Errei", "% lembrança"] : ["Resp.", "Acertos", "Erros", "% de acerto"];
+  const nomeUnidades = cfg.rotuloUnidade === "Matéria" ? ["matéria", "matérias"] : ["assunto", "assuntos"];
+
+  const cardsHTML = ehFlash ? `
+      <div class="desemp-card"><span class="desemp-card-valor">${total}</span><span class="desemp-card-rotulo">revisões</span></div>
+      <div class="desemp-card ok"><span class="desemp-card-valor">${acertos}</span><span class="desemp-card-rotulo">lembrei ✅</span></div>
+      <div class="desemp-card erro"><span class="desemp-card-valor">${erros}</span><span class="desemp-card-rotulo">errei ❌</span></div>
+      <div class="desemp-card ${classeTaxa(taxaGeral)}"><span class="desemp-card-valor">${taxaGeral === null ? "—" : taxaGeral + "%"}</span><span class="desemp-card-rotulo">de lembrança</span></div>`
+    : `
+      <div class="desemp-card"><span class="desemp-card-valor">${total}</span><span class="desemp-card-rotulo">respondidas</span></div>
+      <div class="desemp-card ok"><span class="desemp-card-valor">${acertos}</span><span class="desemp-card-rotulo">acertos ✅</span></div>
+      <div class="desemp-card erro"><span class="desemp-card-valor">${erros}</span><span class="desemp-card-rotulo">erros ❌</span></div>
+      <div class="desemp-card ${classeTaxa(taxaGeral)}"><span class="desemp-card-valor">${taxaGeral === null ? "—" : taxaGeral + "%"}</span><span class="desemp-card-rotulo">de acerto</span></div>`;
+
+  el.innerHTML = `
+    ${abasHTML}
+
+    <div class="desemp-controles">
+      <div class="desemp-pills">${pills}</div>
+      <label class="desemp-data">
+        <span>📅 Dia específico:</span>
+        <input type="date" id="desemp-data" value="${state.desempPeriodo === "data" ? state.desempData : ""}" max="${chaveDia(Date.now())}">
+      </label>
+    </div>
+
+    <h3 class="desemp-titulo">${escapeHTML(rotuloPeriodoDesempenho())} <small>· ${sequencia} ${sequencia === 1 ? "dia seguido" : "dias seguidos"} ${ehFlash ? "revisando" : "resolvendo questões"} 🔥</small></h3>
+
+    <div class="desemp-resumo quatro">${cardsHTML}</div>
+
+    <h3 class="desemp-titulo">Últimos 14 dias <small>(clique em um dia para filtrar)</small></h3>
+    <div class="desemp-faixa">${faixaHTML}</div>
+
+    <div class="view-header-row desemp-tabela-topo">
+      <h3 class="desemp-titulo" style="margin:0;">Detalhes por ${cfg.rotuloUnidade.toLowerCase()}</h3>
+      <select class="select-mini" id="desemp-ordem" title="Ordenar">
+        <option value="assunto" ${ordem === "assunto" ? "selected" : ""}>Ordem do cadastro</option>
+        <option value="pior" ${ordem === "pior" ? "selected" : ""}>Pior desempenho primeiro</option>
+        <option value="melhor" ${ordem === "melhor" ? "selected" : ""}>Melhor desempenho primeiro</option>
+        <option value="mais" ${ordem === "mais" ? "selected" : ""}>Mais atividade primeiro</option>
+      </select>
+    </div>
+
+    ${lista.length === 0 ? `
+      <div class="empty-state">
+        <span class="empty-emoji">🗓️</span>
+        <p>${ehFlash ? "Nenhum flashcard revisado neste período." : "Nenhuma questão respondida neste período."}</p>
+      </div>` : `
+      <div class="desemp-tabela">
+        <div class="desemp-linha desemp-cabecalho">
+          <span class="desemp-nome">${cfg.rotuloUnidade}</span>
+          <span class="desemp-num">${cab[0]}</span>
+          <span class="desemp-num desemp-acerto">${cab[1]}</span>
+          <span class="desemp-num desemp-erro">${cab[2]}</span>
+          <span class="desemp-taxa">${cab[3]}</span>
+        </div>
+        ${lista.map(linhaHTML).join("")}
+      </div>
+      ${ocultas > 0 ? `<p class="desemp-rodape">${ocultas} ${ocultas === 1 ? nomeUnidades[0] : nomeUnidades[1]} sem atividade neste período.</p>` : ""}
+      ${ehFlash && semNota > 0 ? `<p class="desemp-rodape">${semNota} revisão(ões) antiga(s), feitas antes do histórico existir, entram só na coluna "Revis." (a nota não foi registrada).</p>` : ""}
+    `}
+  `;
+
+  // ---- eventos ----
+  ligarAbas();
+  el.querySelectorAll(".desemp-pill").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.desempPeriodo = btn.dataset.periodo;
+      state.desempData = "";
+      cfg.rerender();
+    });
+  });
+  el.querySelectorAll(".desemp-dia").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.desempPeriodo = "data";
+      state.desempData = btn.dataset.dia;
+      cfg.rerender();
+    });
+  });
+  document.getElementById("desemp-data").addEventListener("change", (e) => {
+    if (!e.target.value) return;
+    state.desempPeriodo = "data";
+    state.desempData = e.target.value;
+    cfg.rerender();
+  });
+  document.getElementById("desemp-ordem").addEventListener("change", (e) => {
+    state.desempOrdem = e.target.value;
+    cfg.rerender();
+  });
+  el.querySelectorAll(".desemp-linha[data-unidade]").forEach(linha => {
+    linha.addEventListener("click", () => {
+      const u = unidades.find(x => String(x.id) === linha.dataset.unidade);
+      if (u) cfg.aoClicar(u, linha.dataset.tipo);
+    });
+  });
+}
+
+/* ============================================================
    7. TELA DO ASSUNTO — ABAS (esqueleto; conteúdo nas próximas etapas)
    ============================================================ */
 
@@ -813,14 +1234,166 @@ function setActiveTab(tabName) {
     renderMateriaisTab(state.currentAssuntoId);
   } else if (tabName === "flashcards") {
     renderFlashcardsTab(state.currentAssuntoId);
-  } else if (tabName === "anotacoes") {
-    renderAnotacoesTab(state.currentAssuntoId);
   }
 }
 
 document.querySelectorAll(".tab-btn").forEach(btn => {
   btn.addEventListener("click", () => setActiveTab(btn.dataset.tab));
 });
+
+
+/* ============================================================
+   7A. CAIXINHA DE ESTUDO (cronômetro + contador de respondidas)
+   Fica fixa no canto da tela enquanto você está dentro de um assunto.
+   - Cronômetro: conta o tempo do assunto (material, questões, flashcards).
+     Pausa sozinho se você sair do app/aba; toque no relógio para pausar/continuar.
+   - Contadores: questões registradas (acertei/errei) e flashcards avaliados.
+   - Os números são do DIA e do assunto: se você sair e voltar, continua de onde parou.
+   ============================================================ */
+
+const SESSAO_LS_KEY = "caderno-sessao-estudo";
+let sessaoEstudo = null; // { assuntoId, dia, ms, q, f, desde, manual }
+let sessaoTimer = null;
+
+function sessaoDiaChave() { return planoChaveData(Date.now()); }
+
+function sessaoLerTodas() {
+  try { return JSON.parse(localStorage.getItem(SESSAO_LS_KEY)) || {}; } catch (e) { return {}; }
+}
+
+function sessaoSalvar() {
+  const S = sessaoEstudo;
+  if (!S) return;
+  try {
+    const todas = sessaoLerTodas();
+    if (!todas[S.dia]) todas[S.dia] = {};
+    todas[S.dia][S.assuntoId] = { ms: sessaoMs(), q: S.q, f: S.f };
+    const limite = planoChaveData(inicioDoDia(-30)); // limpa dias antigos
+    for (const k of Object.keys(todas)) if (k < limite) delete todas[k];
+    localStorage.setItem(SESSAO_LS_KEY, JSON.stringify(todas));
+  } catch (e) { console.warn("Não foi possível salvar a sessão de estudo:", e); }
+}
+
+function sessaoMs() {
+  const S = sessaoEstudo;
+  if (!S) return 0;
+  return S.ms + (S.desde ? Date.now() - S.desde : 0);
+}
+
+function sessaoFormatar(ms) {
+  const t = Math.floor(ms / 1000);
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+  const dois = n => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${dois(m)}:${dois(s)}` : `${dois(m)}:${dois(s)}`;
+}
+
+function sessaoCaixa() {
+  let el = document.getElementById("sessao-estudo");
+  if (el) return el;
+  el = document.createElement("div");
+  el.id = "sessao-estudo";
+  el.className = "sessao-estudo";
+  el.hidden = true;
+  el.innerHTML = `
+    <button type="button" class="sessao-tempo" id="sessao-tempo-btn" title="Tempo neste assunto hoje. Toque para pausar/continuar.">
+      <span class="sessao-ico" id="sessao-ico">⏱</span> <b id="sessao-tempo">00:00</b>
+    </button>
+    <span class="sessao-sep"></span>
+    <span class="sessao-cont" title="Questões respondidas hoje neste assunto">❓ <b id="sessao-q">0</b></span>
+    <span class="sessao-cont" title="Flashcards avaliados hoje neste assunto">🃏 <b id="sessao-f">0</b></span>
+    <button type="button" class="sessao-zerar" id="sessao-zerar" title="Zerar tempo e contadores de hoje">↺</button>`;
+  document.body.appendChild(el);
+  document.getElementById("sessao-tempo-btn").addEventListener("click", () => {
+    if (!sessaoEstudo) return;
+    if (sessaoEstudo.manual) { sessaoEstudo.manual = false; sessaoRetomar(); }
+    else { sessaoEstudo.manual = true; sessaoPausar(); }
+    sessaoAtualizar();
+  });
+  document.getElementById("sessao-zerar").addEventListener("click", () => {
+    if (!sessaoEstudo) return;
+    if (!confirm("Zerar o tempo e os contadores de hoje neste assunto?")) return;
+    sessaoEstudo.ms = 0; sessaoEstudo.q = 0; sessaoEstudo.f = 0;
+    if (sessaoEstudo.desde) sessaoEstudo.desde = Date.now();
+    sessaoSalvar();
+    sessaoAtualizar();
+  });
+  return el;
+}
+
+function sessaoAtualizar() {
+  const S = sessaoEstudo;
+  const el = sessaoCaixa();
+  if (!S) { el.hidden = true; return; }
+  el.hidden = false;
+  document.getElementById("sessao-tempo").textContent = sessaoFormatar(sessaoMs());
+  document.getElementById("sessao-q").textContent = S.q;
+  document.getElementById("sessao-f").textContent = S.f;
+  const pausado = !S.desde;
+  el.classList.toggle("pausado", pausado);
+  document.getElementById("sessao-ico").textContent = pausado ? "⏸" : "⏱";
+}
+
+function sessaoPausar() {
+  const S = sessaoEstudo;
+  if (!S || !S.desde) return;
+  S.ms += Date.now() - S.desde;
+  S.desde = null;
+  sessaoSalvar();
+}
+
+function sessaoRetomar() {
+  const S = sessaoEstudo;
+  if (!S || S.desde || S.manual) return;
+  if (document.visibilityState === "hidden") return;
+  S.desde = Date.now();
+}
+
+function sessaoEstudoEntrar(assuntoId) {
+  if (sessaoEstudo && sessaoEstudo.assuntoId === assuntoId && sessaoEstudo.dia === sessaoDiaChave()) {
+    sessaoEstudo.manual = false;
+    sessaoRetomar();
+  } else {
+    sessaoPausar();
+    const dia = sessaoDiaChave();
+    const salvo = (sessaoLerTodas()[dia] || {})[assuntoId] || {};
+    sessaoEstudo = { assuntoId, dia, ms: salvo.ms || 0, q: salvo.q || 0, f: salvo.f || 0, desde: null, manual: false };
+    sessaoRetomar();
+  }
+  clearInterval(sessaoTimer);
+  sessaoTimer = setInterval(() => {
+    // virou o dia com o assunto aberto: começa um novo dia do zero
+    if (sessaoEstudo && sessaoEstudo.dia !== sessaoDiaChave()) { sessaoPausar(); sessaoEstudoEntrar(sessaoEstudo.assuntoId); return; }
+    sessaoAtualizar();
+    if (sessaoEstudo && sessaoEstudo.desde && Math.floor(Date.now() / 1000) % 10 === 0) sessaoSalvar();
+  }, 1000);
+  sessaoAtualizar();
+}
+
+function sessaoEstudoSair() {
+  if (!sessaoEstudo) { const el = document.getElementById("sessao-estudo"); if (el) el.hidden = true; return; }
+  sessaoPausar();
+  sessaoSalvar();
+  clearInterval(sessaoTimer);
+  sessaoTimer = null;
+  sessaoEstudo = null;
+  sessaoAtualizar();
+}
+
+function sessaoEstudoContar(tipo, delta) {
+  const S = sessaoEstudo;
+  if (!S) return;
+  S[tipo] = Math.max(0, (S[tipo] || 0) + delta);
+  sessaoSalvar();
+  sessaoAtualizar();
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!sessaoEstudo) return;
+  if (document.visibilityState === "hidden") sessaoPausar();
+  else sessaoRetomar();
+  sessaoAtualizar();
+});
+window.addEventListener("pagehide", () => { if (sessaoEstudo) { sessaoPausar(); sessaoSalvar(); } });
 
 /* ============================================================
    7B. ABA QUESTÕES — páginas de 10, imagem, resposta, comentários,
@@ -866,7 +1439,8 @@ async function renderQuestoesTab(assuntoId) {
 
   const { status, dificuldade, favorito } = state.filtros;
   const desempenho = state.filtros.desempenho || "todos";
-  const filtroAtivo = status !== "todos" || dificuldade !== "todos" || favorito || desempenho !== "todos";
+  const respondidas = state.filtros.respondidas || "todos";
+  const filtroAtivo = status !== "todos" || dificuldade !== "todos" || favorito || desempenho !== "todos" || respondidas !== "todos";
 
   const filtradas = comNumero.filter(q => {
     if (status !== "todos" && q.status !== status) return false;
@@ -877,6 +1451,13 @@ async function renderQuestoesTab(assuntoId) {
       if (desempenho === "nunca" && r.total > 0) return false;
       if (desempenho === "errei_ultima" && !(r.ultima && !r.ultima.acertou)) return false;
       if (desempenho === "ja_errei" && r.erros === 0) return false;
+    }
+    if (respondidas !== "todos") {
+      const n = resumoTentativas(q).total; // quantas vezes a questão foi respondida
+      if (respondidas === "1-3" && !(n >= 1 && n <= 3)) return false;
+      if (respondidas === "3-5" && !(n >= 3 && n <= 5)) return false;
+      if (respondidas === "5-7" && !(n >= 5 && n <= 7)) return false;
+      if (respondidas === "7+" && !(n >= 7)) return false;
     }
     return true;
   });
@@ -914,6 +1495,13 @@ async function renderQuestoesTab(assuntoId) {
           <option value="errei_ultima" ${desempenho === "errei_ultima" ? "selected" : ""}>Errei na última vez</option>
           <option value="ja_errei" ${desempenho === "ja_errei" ? "selected" : ""}>Já errei alguma vez</option>
         </select>
+        <select class="select-mini" id="filtro-respondidas" title="Quantas vezes a questão foi respondida">
+          <option value="todos" ${respondidas === "todos" ? "selected" : ""}>Qtd. respondida: todas</option>
+          <option value="1-3" ${respondidas === "1-3" ? "selected" : ""}>Respondida 1 a 3 vezes</option>
+          <option value="3-5" ${respondidas === "3-5" ? "selected" : ""}>Respondida 3 a 5 vezes</option>
+          <option value="5-7" ${respondidas === "5-7" ? "selected" : ""}>Respondida 5 a 7 vezes</option>
+          <option value="7+" ${respondidas === "7+" ? "selected" : ""}>Respondida 7 vezes ou mais</option>
+        </select>
         <button class="btn-toggle-favorito ${favorito ? "active" : ""}" id="filtro-favorito" title="Só favoritas">⭐ Favoritas</button>
         ${filtroAtivo ? `<button class="btn-ghost" id="btn-limpar-filtros">Limpar filtros</button>` : ""}
       </div>
@@ -929,7 +1517,14 @@ async function renderQuestoesTab(assuntoId) {
     <div class="questoes-dica">💡 Dica: cole prints com <b>Ctrl+V</b> (um atrás do outro) ou arraste várias imagens para cá. Cada imagem vira uma questão; as respostas e comentários você preenche depois.</div>
     <div class="paginacao" id="paginacao"></div>
     <div class="questoes-lista" id="questoes-lista"></div>
+    <div class="paginacao paginacao-fim" id="paginacao-fim"></div>
   `;
+
+  // guarda o que está na tela (filtros + ordem atuais) para o PDF por aba
+  state.questoesTela = {
+    assuntoId,
+    itens: filtradas.map(q => ({ id: q.id, numero: q.numeroGlobal })),
+  };
 
   document.getElementById("select-ordem").addEventListener("change", (e) => {
     state.ordem = e.target.value;
@@ -961,6 +1556,11 @@ async function renderQuestoesTab(assuntoId) {
     state.currentPagina = 1;
     renderQuestoesTab(assuntoId);
   });
+  document.getElementById("filtro-respondidas").addEventListener("change", (e) => {
+    state.filtros.respondidas = e.target.value;
+    state.currentPagina = 1;
+    renderQuestoesTab(assuntoId);
+  });
   document.getElementById("filtro-favorito").addEventListener("click", () => {
     state.filtros.favorito = !state.filtros.favorito;
     state.currentPagina = 1;
@@ -969,7 +1569,7 @@ async function renderQuestoesTab(assuntoId) {
   const btnLimpar = document.getElementById("btn-limpar-filtros");
   if (btnLimpar) {
     btnLimpar.addEventListener("click", () => {
-      state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+      state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
       state.currentPagina = 1;
       renderQuestoesTab(assuntoId);
     });
@@ -984,22 +1584,35 @@ async function renderQuestoesTab(assuntoId) {
     adicionarQuestoesEmLote(assuntoId, arquivos);
   });
 
-  // paginação
-  const paginacaoEl = document.getElementById("paginacao");
-  if (filtradas.length === 0) {
-    paginacaoEl.innerHTML = "";
-  } else {
-    for (let p = 1; p <= totalPaginas; p++) {
-      const pill = document.createElement("button");
-      pill.className = "pagina-pill" + (p === state.currentPagina ? " active" : "");
-      pill.textContent = p;
-      pill.addEventListener("click", () => {
-        state.currentPagina = p;
-        renderQuestoesTab(assuntoId);
-      });
-      paginacaoEl.appendChild(pill);
-    }
-  }
+  // paginação (no topo e no fim da lista)
+  const montarPaginacao = (el, rolarAoTopo) => {
+    el.innerHTML = "";
+    if (filtradas.length === 0) return;
+    const irPara = async (p) => {
+      state.currentPagina = p;
+      await renderQuestoesTab(assuntoId);
+      if (rolarAoTopo) container.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    const criar = (texto, p, classe, desativado) => {
+      const b = document.createElement("button");
+      b.className = "pagina-pill " + classe;
+      b.textContent = texto;
+      b.disabled = !!desativado;
+      if (!desativado) b.addEventListener("click", () => irPara(p));
+      el.appendChild(b);
+    };
+    if (totalPaginas > 1) criar("‹ Anterior", state.currentPagina - 1, "pagina-nav", state.currentPagina <= 1);
+    for (let p = 1; p <= totalPaginas; p++) criar(String(p), p, p === state.currentPagina ? "active" : "");
+    if (totalPaginas > 1) criar("Próxima ›", state.currentPagina + 1, "pagina-nav", state.currentPagina >= totalPaginas);
+    const ini = (state.currentPagina - 1) * QUESTOES_POR_PAGINA + 1;
+    const fim = Math.min(filtradas.length, state.currentPagina * QUESTOES_POR_PAGINA);
+    const info = document.createElement("span");
+    info.className = "pagina-info";
+    info.textContent = `${ini}–${fim} de ${filtradas.length}`;
+    el.appendChild(info);
+  };
+  montarPaginacao(document.getElementById("paginacao"), false);
+  montarPaginacao(document.getElementById("paginacao-fim"), true);
 
   // lista da página atual
   const listaEl = document.getElementById("questoes-lista");
@@ -1079,7 +1692,7 @@ async function adicionarQuestao(assuntoId) {
   };
   await dbPut("questoes", novaQuestao);
   const questoes = await getQuestoesOrdenadas(assuntoId);
-  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
   state.currentPagina = Math.max(1, Math.ceil(questoes.length / QUESTOES_POR_PAGINA));
   showToast("Questão adicionada.");
   renderQuestoesTab(assuntoId);
@@ -1113,7 +1726,7 @@ async function adicionarQuestoesEmLote(assuntoId, arquivos) {
       });
     }
     const questoes = await getQuestoesOrdenadas(assuntoId);
-    state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+    state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
     state.currentPagina = Math.max(1, Math.ceil(questoes.length / QUESTOES_POR_PAGINA));
     showToast(imagens.length === 1 ? "1 questão adicionada." : `${imagens.length} questões adicionadas.`);
     renderQuestoesTab(assuntoId);
@@ -1178,8 +1791,12 @@ function criarQuestaoCard(questao, numeroGlobal) {
       </div>
     </div>
 
-    <div class="questao-imagem-area" id="img-area-${questao.id}"></div>
+    <div class="questao-corpo">
+    <div class="questao-col-imagem">
+      <div class="questao-imagem-area" id="img-area-${questao.id}"></div>
+    </div>
 
+    <div class="questao-col-resposta">
     <div class="questao-metricas"></div>
 
     <button type="button" class="btn-toggle-resposta"></button>
@@ -1206,6 +1823,8 @@ function criarQuestaoCard(questao, numeroGlobal) {
         <button type="button" class="btn-errei">❌ Errei</button>
         <button type="button" class="btn-desfazer-tentativa" title="Desfazer o último registro">↩ Desfazer</button>
       </div>
+    </div>
+    </div>
     </div>
     </div>
   `;
@@ -1269,6 +1888,7 @@ function criarQuestaoCard(questao, numeroGlobal) {
       statusMudou = true;
     }
     await dbPut("questoes", questao);
+    sessaoEstudoContar("q", 1);
     if (statusMudou && state.filtros.status !== "todos") {
       renderQuestoesTab(questao.assuntoId);
       return;
@@ -1288,6 +1908,7 @@ function criarQuestaoCard(questao, numeroGlobal) {
     if (!(questao.tentativas || []).length) return;
     questao.tentativas.pop();
     await dbPut("questoes", questao);
+    sessaoEstudoContar("q", -1);
     atualizarMetricas();
     showToast("Último registro desfeito.");
   });
@@ -1414,7 +2035,7 @@ function abrirLeitorQuestao(questao, numero, resposta, comentario) {
     <section class="leitor-bloco">
       <h3 class="leitor-bloco-titulo">${titulo}</h3>
       ${(texto || "").trim()
-        ? `<div class="leitor-texto">${escapeHTML(texto)}</div>`
+        ? `<div class="leitor-texto">${formatarTextoRico(texto)}</div>`
         : `<p class="leitor-vazio">Nada preenchido aqui ainda.</p>`}
     </section>`;
 
@@ -1888,40 +2509,6 @@ function formatarData(timestamp) {
   return d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
 }
 
-/* ============================================================
-   7D. ABA ANOTAÇÕES — editor simples de texto, com autosave
-   ============================================================ */
-
-async function renderAnotacoesTab(assuntoId) {
-  if (!assuntoId) return;
-  const container = document.getElementById("anotacoes-container");
-  const anotacao = await dbGet("anotacoes", assuntoId);
-  const texto = anotacao ? anotacao.texto : "";
-
-  container.innerHTML = `
-    <div class="anotacoes-toolbar">
-      <span class="anotacoes-status" id="anotacoes-status">
-        ${anotacao && anotacao.atualizadoEm ? "Salvo em " + formatarDataHora(anotacao.atualizadoEm) : "Comece a escrever..."}
-      </span>
-    </div>
-    <textarea id="anotacoes-editor" class="anotacoes-editor" placeholder="Escreva livremente suas anotações sobre esse assunto — resumos, macetes, fórmulas, o que quiser. É salvo automaticamente.">${escapeHTML(texto)}</textarea>
-  `;
-
-  const editor = document.getElementById("anotacoes-editor");
-  const statusEl = document.getElementById("anotacoes-status");
-  let debounceAnotacao = null;
-
-  editor.addEventListener("input", () => {
-    statusEl.textContent = "Salvando...";
-    clearTimeout(debounceAnotacao);
-    debounceAnotacao = setTimeout(async () => {
-      const agora = Date.now();
-      await dbPut("anotacoes", { assuntoId, texto: editor.value, atualizadoEm: agora });
-      statusEl.textContent = "Salvo em " + formatarDataHora(agora);
-    }, 500);
-  });
-}
-
 function formatarDataHora(timestamp) {
   if (!timestamp) return "";
   const d = new Date(timestamp);
@@ -2078,6 +2665,7 @@ async function renderFlashcardsTab(assuntoId) {
         <div class="flash-item-lado">
           <span class="flash-badge ${rotulo.classe}">${rotulo.texto}</span>
           ${selecionando ? "" : `
+            <button class="btn-icon btn-copy-flash" title="Copiar cartão">📋</button>
             <button class="btn-icon btn-edit-flash" title="Editar">✏️</button>
             <button class="btn-icon btn-delete-flash" title="Excluir">🗑️</button>`}
         </div>
@@ -2095,6 +2683,7 @@ async function renderFlashcardsTab(assuntoId) {
           if (e.target.closest(".btn-icon")) return;
           abrirModalFlashcard(assuntoId, f);
         });
+        row.querySelector(".btn-copy-flash").addEventListener("click", () => copiarFlashcard(f));
         row.querySelector(".btn-edit-flash").addEventListener("click", () => abrirModalFlashcard(assuntoId, f));
         row.querySelector(".btn-delete-flash").addEventListener("click", () => confirmDeleteFlashcard(f));
       }
@@ -2189,6 +2778,11 @@ function interpretarFlashcardsImportados(bruto) {
     else invalidos++;
   }
   return { cards, invalidos, erro: null };
+}
+
+async function copiarFlashcard(f) {
+  const ok = await copiarParaAreaDeTransferencia(`Frente: ${f.frente}\nVerso: ${f.verso}`);
+  showToast(ok ? "Cartão copiado 📋" : "Não consegui copiar.");
 }
 
 async function copiarParaAreaDeTransferencia(texto) {
@@ -2404,7 +2998,8 @@ function abrirModalFlashcard(assuntoId, flashcard = null) {
     } else {
       closeModal();
     }
-    renderFlashcardsTab(assuntoId);
+    if (flashSessao) renderRevisao(); // editando durante a revisão: continua na revisão
+    else renderFlashcardsTab(assuntoId);
   };
 
   document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
@@ -2438,7 +3033,22 @@ function confirmDeleteFlashcard(flashcard) {
     await dbDelete("flashcards", flashcard.id);
     closeModal();
     showToast("Flashcard excluído.");
-    renderFlashcardsTab(flashcard.assuntoId);
+    const s = flashSessao;
+    if (s && s.assuntoId === flashcard.assuntoId) {
+      // excluindo durante a revisão: tira o cartão da fila e segue para o próximo
+      let antes = 0;
+      s.fila = s.fila.filter((x, i) => {
+        if (x.id !== flashcard.id) return true;
+        if (i < s.indice) antes++;
+        return false;
+      });
+      s.indice -= antes;
+      s.virada = false;
+      if (s.fila.length === 0) sairDaRevisao();
+      else renderRevisao();
+    } else {
+      renderFlashcardsTab(flashcard.assuntoId);
+    }
   });
 }
 
@@ -2517,6 +3127,11 @@ function renderRevisao() {
       <div class="progresso-revisao" style="height:6px;">
         <div class="progresso-revisao-barra" style="width:${pct}%; background:var(--accent);"></div>
       </div>
+      <div class="flash-revisao-acoes">
+        <button class="btn-icon" id="btn-rev-copiar" title="Copiar cartão">📋</button>
+        <button class="btn-icon" id="btn-rev-editar" title="Editar este cartão">✏️</button>
+        <button class="btn-icon" id="btn-rev-excluir" title="Excluir este cartão">🗑️</button>
+      </div>
       <div class="flash-scene">
         <div class="flash-card ${s.virada ? "virado" : ""}" id="flash-card">
           <div class="flash-face">
@@ -2536,6 +3151,9 @@ function renderRevisao() {
 
   document.getElementById("flash-card").addEventListener("click", virarFlashcard);
   document.getElementById("btn-sair-revisao").addEventListener("click", sairDaRevisao);
+  document.getElementById("btn-rev-copiar").addEventListener("click", () => copiarFlashcard(f));
+  document.getElementById("btn-rev-editar").addEventListener("click", () => abrirModalFlashcard(s.assuntoId, f));
+  document.getElementById("btn-rev-excluir").addEventListener("click", () => confirmDeleteFlashcard(f));
   renderAcoesRevisao();
 }
 
@@ -2591,12 +3209,20 @@ async function avaliarFlashcard(nota) {
     const { caixa, dias } = calcularProximaRevisao(f.caixa ?? 0, nota);
     f.caixa = caixa;
     f.proximaRevisao = inicioDoDia(dias);
+    // histórico de revisões (alimenta o painel de desempenho). Cartões antigos, que só
+    // tinham "ultimaRevisao", ganham uma entrada inicial sem nota.
+    if (!Array.isArray(f.historico)) {
+      f.historico = [];
+      if (typeof f.ultimaRevisao === "number") f.historico.push({ em: f.ultimaRevisao, nota: null });
+    }
+    f.historico.push({ em: Date.now(), nota });
     f.ultimaRevisao = Date.now();
     f.revisoes = (f.revisoes ?? 0) + 1;
     if (nota === "errei") f.erros = (f.erros ?? 0) + 1;
     await dbPut("flashcards", f);
 
     s.stats[nota]++;
+    sessaoEstudoContar("f", 1);
     if (nota === "errei") s.fila.push(f); // volta no fim da sessão até acertar
     s.indice++;
     s.virada = false;
@@ -2707,10 +3333,9 @@ async function runSearch(termo) {
 
   const termoLower = termo.toLowerCase();
 
-  const [todosAssuntos, todasQuestoes, todasAnotacoes] = await Promise.all([
+  const [todosAssuntos, todasQuestoes] = await Promise.all([
     dbGetAll("assuntos"),
     dbGetAll("questoes"),
-    dbGetAll("anotacoes"),
   ]);
 
   const mapaAssuntos = new Map(todosAssuntos.map(a => [a.id, a]));
@@ -2722,11 +3347,7 @@ async function runSearch(termo) {
     (q.comentario && q.comentario.toLowerCase().includes(termoLower))
   );
 
-  const anotacoesMatch = todasAnotacoes.filter(n =>
-    n.texto && n.texto.toLowerCase().includes(termoLower)
-  );
-
-  const totalResultados = assuntosMatch.length + questoesMatch.length + anotacoesMatch.length;
+  const totalResultados = assuntosMatch.length + questoesMatch.length;
 
   if (totalResultados === 0) {
     container.innerHTML = `
@@ -2762,7 +3383,7 @@ async function runSearch(termo) {
     container.appendChild(criarGrupoBusca("❓ Questões (respostas e comentários)", questoesMatch.map(questao => {
       const assunto = mapaAssuntos.get(questao.assuntoId);
       const materia = assunto ? getMateriaById(assunto.materiaId) : null;
-      const trechoOrigem = (questao.resposta && questao.resposta.toLowerCase().includes(termoLower)) ? questao.resposta : questao.comentario;
+      const trechoOrigem = semMarcacao((questao.resposta && questao.resposta.toLowerCase().includes(termoLower)) ? questao.resposta : questao.comentario);
       return criarLinhaBusca({
         icone: "❓",
         titulo: assunto ? assunto.nome : "Questão",
@@ -2774,31 +3395,10 @@ async function runSearch(termo) {
           const ordenadas = await getQuestoesOrdenadas(assunto.id);
           const idx = ordenadas.findIndex(q => q.id === questao.id);
           state.currentPagina = idx >= 0 ? Math.ceil((idx + 1) / QUESTOES_POR_PAGINA) : 1;
-          state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+          state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
           document.getElementById("search-input").value = "";
           await goToAssunto(assunto.id);
           setActiveTab("questoes");
-        },
-      });
-    })));
-  }
-
-  // --- anotações ---
-  if (anotacoesMatch.length > 0) {
-    container.appendChild(criarGrupoBusca("📝 Anotações", anotacoesMatch.map(anotacao => {
-      const assunto = mapaAssuntos.get(anotacao.assuntoId);
-      const materia = assunto ? getMateriaById(assunto.materiaId) : null;
-      return criarLinhaBusca({
-        icone: "📝",
-        titulo: assunto ? assunto.nome : "Anotação",
-        meta: (materia ? rotuloMateria(materia) + " · " : "") + trechoDestaque(anotacao.texto, termoLower),
-        onClick: async () => {
-          if (!assunto) return;
-          ativarConcursoDaMateria(assunto.materiaId);
-          state.currentMateriaId = assunto.materiaId;
-          document.getElementById("search-input").value = "";
-          await goToAssunto(assunto.id);
-          setActiveTab("anotacoes");
         },
       });
     })));
@@ -2884,9 +3484,8 @@ async function getProgressoPorMateria() {
 async function renderRoteiro() {
   const progresso = await getProgressoPorMateria();
   renderRoteiroResumo(progresso);
-  await renderSugestaoDoDia(progresso);
-  await renderCronogramaGrid();
   renderChecklist(progresso);
+  renderPlanoSemana().catch(err => console.error("Erro ao montar o plano da semana:", err));
 }
 
 async function renderRoteiroBanner() {
@@ -2897,10 +3496,24 @@ async function renderRoteiroBanner() {
   const progresso = await getProgressoPorMateria();
   const { totalGeral, feitosGeral, pctGeral } = totalizarProgresso(progresso);
 
+  // contagem regressiva para a prova (se o roteiro tiver data)
+  let prova = "";
+  const dataProva = concursoBanner.dataProva || DATAS_PROVA[concursoBanner.id];
+  if (dataProva) {
+    const [a, m, d] = dataProva.split("-").map(Number);
+    const dias = Math.round((new Date(a, m - 1, d).getTime() - inicioDoDia(0)) / 86400000);
+    if (dias >= 0) {
+      const restantes = Math.max(totalGeral - feitosGeral, 0);
+      const ritmo = restantes > 0 && dias > 0 ? ` · faltam ${restantes} tópicos: ~${(restantes / (dias / 7)).toFixed(1).replace(".", ",")} por semana` : "";
+      prova = `<span class="roteiro-banner-sub">⏳ <b>${dias === 0 ? "A prova é hoje!" : dias + (dias === 1 ? " dia" : " dias") + " para a prova"}</b> (${String(d).padStart(2, "0")}/${String(m).padStart(2, "0")}/${a})${ritmo}</span>`;
+    }
+  }
+
   banner.innerHTML = `
     <div class="roteiro-banner-texto">
       <span class="roteiro-banner-titulo">🗺️ Roteiro — ${escapeHTML(concursoBanner.nome)}</span>
       <span class="roteiro-banner-sub">${pctGeral}% do edital concluído · ${feitosGeral}/${totalGeral} tópicos</span>
+      ${prova}
     </div>
     <div class="progresso-revisao" style="flex:1; min-width:140px; max-width:220px; height:8px;">
       <div class="progresso-revisao-barra" style="width:${pctGeral}%; background:var(--accent);"></div>
@@ -2931,144 +3544,8 @@ function renderRoteiroResumo(progresso) {
         <div class="progresso-revisao-barra" style="width:${pctGeral}%; background:var(--accent);"></div>
       </div>
     </div>
-    <div class="resumo-materias-grid">
-      ${MATERIAS.map(m => `
-        <div class="resumo-materia-item" style="--card-color:${m.cor};">
-          <div class="resumo-materia-topo">
-            <span>${m.icone} ${escapeHTML(m.nome)}</span>
-            <span class="resumo-materia-pct">${progresso[m.id].feitos}/${progresso[m.id].total}</span>
-          </div>
-          <div class="progresso-revisao">
-            <div class="progresso-revisao-barra" style="width:${progresso[m.id].pct}%;"></div>
-          </div>
-        </div>
-      `).join("")}
-    </div>
   `;
 }
-
-async function renderSugestaoDoDia(progresso) {
-  const hoje = new Date().getDay(); // 0 = Domingo ... 6 = Sábado
-  const cronogramaHoje = await dbGet("cronograma", hoje).catch(() => null);
-  const el = document.getElementById("roteiro-sugestao");
-
-  let materiasAlvo = [];
-  if (cronogramaHoje && cronogramaHoje.materiaIds) {
-    // só as matérias deste roteiro (o cronograma guarda ids de todos os roteiros)
-    materiasAlvo = cronogramaHoje.materiaIds
-      .map(id => MATERIAS.find(m => m.id === id))
-      .filter(Boolean);
-  }
-  const temCronogramaHoje = materiasAlvo.length > 0;
-
-  if (!temCronogramaHoje) {
-    // sem cronograma definido para hoje: sugere as matérias com menor % de conclusão
-    materiasAlvo = [...MATERIAS]
-      .filter(m => progresso[m.id].pct < 100)
-      .sort((a, b) => progresso[a.id].pct - progresso[b.id].pct)
-      .slice(0, 2);
-  }
-
-  if (materiasAlvo.length === 0) {
-    el.innerHTML = `
-      <div class="empty-state">
-        <span class="empty-emoji">🎉</span>
-        <p>Todos os tópicos cadastrados no checklist já foram concluídos.</p>
-      </div>`;
-    return;
-  }
-
-  el.innerHTML = `
-    <div class="sugestao-dia-label">
-      ${temCronogramaHoje ? "Hoje é dia de estudar:" : "Sem cronograma definido para hoje — sugestão automática (menor progresso):"}
-      <b>${DIAS_SEMANA[hoje]}</b>
-    </div>
-    <div class="sugestao-cards">
-      ${materiasAlvo.map(m => {
-        const prog = progresso[m.id];
-        const proximo = prog.topicos.find(t => !t.concluido);
-        return `
-          <div class="sugestao-card" style="--card-color:${m.cor};" data-materia="${m.id}">
-            <div class="sugestao-card-topo">${m.icone} <b>${escapeHTML(m.nome)}</b></div>
-            <div class="sugestao-card-topico">${proximo ? "Próximo tópico: " + escapeHTML(proximo.nome) : (prog.total === 0 ? "Nenhum tópico cadastrado ainda." : "Todos os tópicos concluídos!")}</div>
-            <span class="sugestao-card-pct">${prog.pct}% concluído</span>
-          </div>
-        `;
-      }).join("")}
-    </div>
-  `;
-
-  el.querySelectorAll(".sugestao-card").forEach(card => {
-    card.addEventListener("click", () => goToMateria(card.dataset.materia));
-  });
-}
-
-async function renderCronogramaGrid() {
-  const grid = document.getElementById("cronograma-grid");
-  const cronogramaTodos = await dbGetAll("cronograma");
-  const mapaCronograma = {};
-  cronogramaTodos.forEach(c => { mapaCronograma[c.dia] = c.materiaIds || []; });
-
-  const hoje = new Date().getDay();
-
-  grid.innerHTML = DIAS_SEMANA.map((nomeDia, dia) => {
-    const selecionadas = mapaCronograma[dia] || [];
-    return `
-      <div class="cronograma-linha ${dia === hoje ? "cronograma-linha-hoje" : ""}">
-        <span class="cronograma-dia-label">${nomeDia}</span>
-        <div class="cronograma-chips" data-dia="${dia}">
-          ${MATERIAS.map(m => `
-            <button type="button" class="cronograma-chip ${selecionadas.includes(m.id) ? "active" : ""}"
-              data-materia="${m.id}" style="--chip-color:${m.cor};">
-              ${m.icone} ${escapeHTML(m.curto || m.nome.split(" ")[0])}
-            </button>
-          `).join("")}
-        </div>
-      </div>
-    `;
-  }).join("");
-
-  grid.querySelectorAll(".cronograma-chip").forEach(chip => {
-    chip.addEventListener("click", async () => {
-      const linha = chip.closest(".cronograma-chips");
-      const dia = Number(linha.dataset.dia);
-      const materiaId = chip.dataset.materia;
-      const atual = mapaCronograma[dia] || [];
-      const novo = atual.includes(materiaId) ? atual.filter(id => id !== materiaId) : [...atual, materiaId];
-      mapaCronograma[dia] = novo;
-      chip.classList.toggle("active");
-      await dbPut("cronograma", { dia, materiaIds: novo });
-      const progresso = await getProgressoPorMateria();
-      renderSugestaoDoDia(progresso);
-    });
-  });
-}
-
-document.getElementById("btn-limpar-cronograma").addEventListener("click", () => {
-  openModal(`
-    <h3 class="modal-title">Limpar cronograma semanal?</h3>
-    <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Isso vai remover as matérias atribuídas aos dias da semana <b>neste roteiro</b> (os outros roteiros não são afetados). Essa ação não pode ser desfeita.
-    </p>
-    <div class="modal-actions">
-      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
-      <button class="btn-danger" id="btn-confirm-limpar-cronograma">Limpar</button>
-    </div>
-  `);
-  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
-  document.getElementById("btn-confirm-limpar-cronograma").addEventListener("click", async () => {
-    const idsAtuais = new Set(MATERIAS.map(m => m.id));
-    const todosDias = await dbGetAll("cronograma");
-    for (const dia of todosDias) {
-      const restante = (dia.materiaIds || []).filter(id => !idsAtuais.has(id));
-      if (restante.length > 0) await dbPut("cronograma", { ...dia, materiaIds: restante });
-      else await dbDelete("cronograma", dia.dia);
-    }
-    closeModal();
-    showToast("Cronograma limpo.");
-    renderRoteiro();
-  });
-});
 
 function renderChecklist(progresso) {
   const container = document.getElementById("checklist-container");
@@ -3172,6 +3649,1040 @@ function abrirModalAddTopico(materiaId) {
 }
 
 /* ============================================================
+   10B. PLANO DA SEMANA E AGENDA DE ESTUDOS
+   Como funciona:
+   - VOCÊ escolhe, dia a dia, qual assunto vai estudar (📖). Fica salvo no
+     banco do app ("agenda") e entra no backup.
+   - O APP calcula sozinho o que revisar (❓ questões e 🃏 flashcards):
+       · Flashcards: usa a data de revisão de cada cartão (caixas 1, 3, 7, 15, 30, 60 dias).
+       · Questões: cada questão volta depois de 1, 3, 7, 15 ou 30 dias, conforme
+         quantas vezes seguidas você acertou. Errou a última? Volta no dia seguinte.
+       · Conteúdo novo (questões sem resposta e cartões novos) entra na fila
+         1 dia depois de você marcar o assunto como estudado.
+       · Se houver muita coisa vencida, o excedente é distribuído nos dias
+         seguintes (limites diários configuráveis).
+   - Só entram na revisão assuntos já estudados (marcados no checklist ou no calendário).
+     Assuntos agendados para o futuro aparecem como "previsto".
+   - "Próximo assunto" = o primeiro tópico não estudado DEPOIS do último estudado
+     da matéria (se nada foi estudado ainda, é o primeiro). Já agendados não se repetem.
+   ============================================================ */
+
+const PLANO_STOPWORDS = new Set(["de", "da", "do", "das", "dos", "e", "a", "o", "as", "os", "em", "na", "no", "nas", "nos", "para", "por", "com", "ao", "aos", "ou", "que", "se", "um", "uma", "lei", "assunto", "n"]);
+
+const AGENDA_LS_LIMITES = "caderno_agenda_limites_v1";
+const AGENDA_LIMITES_PADRAO = { q: 30, f: 60 };
+// dias até rever uma questão, conforme quantas vezes seguidas ela foi acertada (0, 1, 2, 3, 4 ou mais)
+const AGENDA_INTERVALOS_Q = [1, 3, 7, 15, 30];
+const MESES_NOMES = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
+const DIAS_CURTOS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+
+/* ---------- utilitários de data e texto ---------- */
+
+function planoNorm(s) {
+  return String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function planoTokens(s) {
+  return new Set(planoNorm(s).split(" ").filter(t => t && !/^\d+$/.test(t) && !PLANO_STOPWORDS.has(t)));
+}
+
+function planoMateriaPrioritaria(materia) {
+  const n = planoNorm(materia.nome);
+  return n.includes("direitos humanos") || n.includes("constitucional");
+}
+
+// liga um assunto ao tópico do checklist com nome parecido (ex.: "02- Garantias fundamentais" → "Direitos e garantias fundamentais e remédios constitucionais")
+function planoCasarTopico(assunto, topicos) {
+  const ta = planoTokens(assunto.nome);
+  if (!ta.size) return null;
+  let melhor = null, melhorScore = 0;
+  for (const t of topicos) {
+    const tt = planoTokens(t.nome);
+    if (!tt.size) continue;
+    let inter = 0;
+    ta.forEach(x => { if (tt.has(x)) inter++; });
+    const menor = Math.min(ta.size, tt.size), maior = Math.max(ta.size, tt.size);
+    let score = inter / (ta.size + tt.size - inter);
+    if (inter === menor) score = Math.max(score, 0.8 + 0.2 * (menor / maior));
+    if (score >= 0.5 && score > melhorScore) { melhor = t; melhorScore = score; }
+  }
+  return melhor;
+}
+
+function planoNomeCurto(nome) {
+  return String(nome).replace(/^\s*\d+\s*[-–.)]*\s*/, "").trim();
+}
+
+function planoChaveData(ts) {
+  const d = new Date(ts);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+function calTs(dataKey) {
+  const [y, m, d] = dataKey.split("-").map(Number);
+  return new Date(y, m - 1, d).getTime();
+}
+
+function calDiaInicio(ts) {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function calSomaDias(ts, n) {
+  const d = new Date(ts);
+  d.setDate(d.getDate() + n);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function calDiffDias(a, b) {
+  return Math.round((calDiaInicio(b) - calDiaInicio(a)) / 86400000);
+}
+
+function calFmtData(dataKey) {
+  const [, m, d] = dataKey.split("-");
+  return `${d}/${m}`;
+}
+
+/* ---------- limites diários ---------- */
+
+function agendaLimites() {
+  try {
+    const l = JSON.parse(localStorage.getItem(AGENDA_LS_LIMITES));
+    const q = Math.round(Number(l && l.q)), f = Math.round(Number(l && l.f));
+    return { q: q >= 1 ? q : AGENDA_LIMITES_PADRAO.q, f: f >= 1 ? f : AGENDA_LIMITES_PADRAO.f };
+  } catch (e) {
+    return { ...AGENDA_LIMITES_PADRAO };
+  }
+}
+
+/* ---------- banco: agenda (uma linha por roteiro + dia) ---------- */
+
+function agendaId(dataKey) {
+  return `${state.currentConcursoId}|${dataKey}`;
+}
+
+async function agendaLerAgenda() {
+  const todos = await dbGetAll("agenda");
+  const mapa = {};
+  for (const r of todos) {
+    if (r.concursoId === state.currentConcursoId && Array.isArray(r.itens)) mapa[r.data] = r;
+  }
+  return mapa;
+}
+
+async function agendaSalvarDia(dataKey, itens) {
+  const id = agendaId(dataKey);
+  if (!itens.length) await dbDelete("agenda", id);
+  else await dbPut("agenda", { id, concursoId: state.currentConcursoId, data: dataKey, itens });
+}
+
+async function agendaCarregarDados() {
+  const materias = MATERIAS.slice();
+  const idsMateria = new Set(materias.map(m => m.id));
+  const topicos = (await dbGetAll("topicos")).filter(t => idsMateria.has(t.materiaId));
+  const assuntos = (await dbGetAll("assuntos")).filter(a => idsMateria.has(a.materiaId));
+  const idsAssunto = new Set(assuntos.map(a => a.id));
+
+  const questoesPorAssunto = {}, flashPorAssunto = {}, materiaisPorAssunto = {};
+  const agrupar = (lista, destino) => {
+    for (const x of lista) {
+      if (!idsAssunto.has(x.assuntoId)) continue;
+      if (!destino[x.assuntoId]) destino[x.assuntoId] = [];
+      destino[x.assuntoId].push(x);
+    }
+  };
+  agrupar(await dbGetAll("questoes"), questoesPorAssunto);
+  agrupar(await dbGetAll("flashcards"), flashPorAssunto);
+  agrupar(await dbGetAll("materiais"), materiaisPorAssunto);
+  return { materias, topicos, assuntos, questoesPorAssunto, flashPorAssunto, materiaisPorAssunto };
+}
+
+/* ---------- classificação: o que já foi estudado e qual é o PRÓXIMO de cada matéria ---------- */
+
+function agendaClassificar(dados, agenda) {
+  const hoje = inicioDoDia(0);
+  const feitoEm = new Map();    // chave -> início do dia em que foi marcado como estudado
+  const pendente = new Set();   // chaves agendadas e ainda não feitas (em qualquer data)
+  const planejado = new Map();  // chave -> dia agendado (de hoje em diante, ainda não feito)
+
+  for (const dk of Object.keys(agenda)) {
+    const ts = calTs(dk);
+    for (const it of (agenda[dk].itens || [])) {
+      if (it.feito) {
+        const quando = calDiaInicio(it.feitoEm || ts);
+        if (!feitoEm.has(it.chave) || quando < feitoEm.get(it.chave)) feitoEm.set(it.chave, quando);
+      } else {
+        pendente.add(it.chave);
+        if (ts >= hoje && (!planejado.has(it.chave) || ts < planejado.get(it.chave))) planejado.set(it.chave, ts);
+      }
+    }
+  }
+
+  const unidades = [], porChave = new Map(), porMateria = new Map();
+
+  for (const mat of dados.materias) {
+    const prioritaria = planoMateriaPrioritaria(mat);
+    const tops = dados.topicos.filter(t => t.materiaId === mat.id).sort((a, b) => (a.ordem ?? 0) - (b.ordem ?? 0));
+    const ass = dados.assuntos.filter(a => a.materiaId === mat.id).sort((a, b) => (a.ordem ?? 0) - (b.ordem ?? 0));
+    const topicosComAssunto = new Set();
+    const lista = [];
+
+    const base = (chave, extra) => ({
+      chave, materiaId: mat.id, materia: mat, prioritaria,
+      estudadoEm: feitoEm.has(chave) ? feitoEm.get(chave) : null,
+      planejadoPara: planejado.has(chave) ? planejado.get(chave) : null,
+      pendente: pendente.has(chave),
+      ...extra,
+    });
+
+    for (const a of ass) {
+      const top = planoCasarTopico(a, tops);
+      if (top) topicosComAssunto.add(top.id);
+      const q = dados.questoesPorAssunto[a.id] || [];
+      const f = dados.flashPorAssunto[a.id] || [];
+      const chave = "a:" + a.id;
+      const feito = feitoEm.has(chave);
+      // sem tópico correspondente no checklist: se já tem questões/flashcards, considera em prática (como antes)
+      const estudado = top ? (!!top.concluido || feito) : (feito || q.length > 0 || f.length > 0);
+      lista.push(base(chave, {
+        assuntoId: a.id, topicoId: top ? top.id : null, topico: top, nome: a.nome,
+        questoes: q, flashcards: f, nMat: (dados.materiaisPorAssunto[a.id] || []).length,
+        estudado, espinha: !!top,
+        ordem: top ? (top.ordem ?? 0) : 1000 + (a.ordem ?? 0),
+      }));
+    }
+
+    for (const t of tops) {
+      if (topicosComAssunto.has(t.id)) continue;
+      const chave = "t:" + t.id;
+      lista.push(base(chave, {
+        assuntoId: null, topicoId: t.id, topico: t, nome: t.nome,
+        questoes: [], flashcards: [], nMat: 0,
+        estudado: !!t.concluido || feitoEm.has(chave), espinha: true,
+        ordem: t.ordem ?? 0,
+      }));
+    }
+
+    lista.sort((a, b) => a.ordem - b.ordem);
+
+    // PRÓXIMO: o primeiro tópico NÃO marcado depois do último marcado (na ordem do roteiro/edital).
+    // Nada marcado ainda => o primeiro. Se não sobrar nada à frente, volta ao começo.
+    // Só muda quando você marca (ou desmarca) um tópico como concluído: agendar no plano não altera.
+    const espinha = lista.filter(u => u.espinha);
+    let ultimo = -1;
+    espinha.forEach((u, i) => { if (u.estudado) ultimo = i; });
+    const candidato = (u) => !u.estudado;
+    let fila = [
+      ...espinha.slice(ultimo + 1).filter(candidato),
+      ...espinha.slice(0, ultimo + 1).filter(candidato),
+    ];
+    // assuntos cadastrados por você que não casam com nenhum tópico do edital entram no fim da fila
+    fila = fila.concat(lista.filter(u => !u.espinha && candidato(u)));
+
+    for (const u of lista) { unidades.push(u); porChave.set(u.chave, u); }
+    porMateria.set(mat.id, { materia: mat, lista, fila, proximo: fila[0] || null });
+  }
+
+  const idxMateria = new Map(dados.materias.map((m, i) => [m.id, i]));
+  const proximos = [...porMateria.values()]
+    .map(i => i.proximo).filter(Boolean)
+    .sort((a, b) => (b.prioritaria - a.prioritaria) || (idxMateria.get(a.materiaId) - idxMateria.get(b.materiaId)));
+
+  return { unidades, porChave, porMateria, proximos };
+}
+
+/* ---------- revisões calculadas pelo app ---------- */
+
+function agendaIntervaloQuestao(streak) {
+  return AGENDA_INTERVALOS_Q[Math.min(streak, AGENDA_INTERVALOS_Q.length - 1)];
+}
+
+// devolve Map(dataKey -> { q: Map(chave -> grupo), f: Map(chave -> grupo), totalQ, totalF })
+function agendaCalcularRevisoes(cl, limites) {
+  const hoje = inicioDoDia(0);
+  const itens = [];
+
+  for (const u of cl.unidades) {
+    if (!u.assuntoId) continue;
+    const ativa = u.estudado || u.planejadoPara != null;
+    if (!ativa) continue;
+
+    // quando o conteúdo ainda não visto (questões sem resposta, cartões novos) entra na fila
+    let disp, projetado = false;
+    if (u.estudado) disp = u.estudadoEm != null ? calSomaDias(u.estudadoEm, 1) : hoje;
+    else { disp = calSomaDias(u.planejadoPara, 1); projetado = true; }
+
+    for (const q of u.questoes) {
+      const t = q.tentativas || [];
+      let due, novo = false, prj = false;
+      if (!t.length) { due = disp; novo = true; prj = projetado; }
+      else {
+        let streak = 0;
+        for (let i = t.length - 1; i >= 0 && t[i].acertou; i--) streak++;
+        due = calSomaDias(calDiaInicio(t[t.length - 1].em), agendaIntervaloQuestao(streak));
+      }
+      itens.push({ tipo: "q", u, due, novo, projetado: prj });
+    }
+
+    for (const c of u.flashcards) {
+      let due, novo = false, prj = false;
+      if (!c.revisoes) { due = disp; novo = true; prj = projetado; }
+      else due = calDiaInicio(c.proximaRevisao ?? 0);
+      itens.push({ tipo: "f", u, due, novo, projetado: prj });
+    }
+  }
+
+  // o que está atrasado cai em "hoje"; prioridade para as matérias prioritárias
+  itens.sort((a, b) =>
+    (Math.max(a.due, hoje) - Math.max(b.due, hoje))
+    || (b.u.prioritaria - a.u.prioritaria)
+    || (a.due - b.due)
+    || (a.u.ordem - b.u.ordem));
+
+  const cargaQ = new Map(), cargaF = new Map();
+  const dias = new Map();
+  for (const it of itens) {
+    const carga = it.tipo === "q" ? cargaQ : cargaF;
+    const cap = it.tipo === "q" ? limites.q : limites.f;
+    let idx = calDiffDias(hoje, Math.max(it.due, hoje));
+    const maxIdx = idx + 730;
+    while ((carga.get(idx) || 0) >= cap && idx < maxIdx) idx++; // dia cheio: empurra para o seguinte
+    carga.set(idx, (carga.get(idx) || 0) + 1);
+
+    const dk = planoChaveData(calSomaDias(hoje, idx));
+    let d = dias.get(dk);
+    if (!d) { d = { q: new Map(), f: new Map(), totalQ: 0, totalF: 0 }; dias.set(dk, d); }
+    const mapa = it.tipo === "q" ? d.q : d.f;
+    let g = mapa.get(it.u.chave);
+    if (!g) { g = { u: it.u, n: 0, novos: 0, atrasadas: 0, projetados: 0 }; mapa.set(it.u.chave, g); }
+    g.n++;
+    if (it.novo) g.novos++;
+    if (it.due < hoje) g.atrasadas++;
+    if (it.projetado) g.projetados++;
+    if (it.tipo === "q") d.totalQ++; else d.totalF++;
+  }
+  return dias;
+}
+
+// o que você realmente fez em cada dia (questões respondidas, cartões revisados)
+function agendaAtividade(dados) {
+  const mapa = {};
+  const somar = (ts, tipo) => {
+    const k = planoChaveData(ts);
+    if (!mapa[k]) mapa[k] = { q: 0, f: 0 };
+    mapa[k][tipo]++;
+  };
+  for (const id in dados.questoesPorAssunto) {
+    for (const q of dados.questoesPorAssunto[id]) {
+      for (const t of (q.tentativas || [])) if (typeof t.em === "number") somar(t.em, "q");
+    }
+  }
+  for (const id in dados.flashPorAssunto) {
+    for (const c of dados.flashPorAssunto[id]) {
+      if (Array.isArray(c.historico) && c.historico.length) {
+        for (const h of c.historico) if (typeof h.em === "number") somar(h.em, "f");
+      } else if (typeof c.ultimaRevisao === "number") somar(c.ultimaRevisao, "f");
+    }
+  }
+  return mapa;
+}
+
+/* ---------- cache e carregamento ---------- */
+
+let agendaCache = null; // { concursoId, dados, agenda, cl, rev, atividade }
+
+function agendaDerivar() {
+  const A = agendaCache;
+  A.cl = agendaClassificar(A.dados, A.agenda);
+  A.rev = agendaCalcularRevisoes(A.cl, agendaLimites());
+  A.atividade = agendaAtividade(A.dados);
+}
+
+// recarrega tudo do banco (ao entrar na tela inicial, no roteiro ou no calendário)
+async function agendaObter() {
+  const dados = await agendaCarregarDados();
+  const agenda = await agendaLerAgenda();
+  agendaCache = { concursoId: state.currentConcursoId, dados, agenda };
+  agendaDerivar();
+  return agendaCache;
+}
+
+// depois de editar o calendário: relê só os tópicos e a agenda
+async function agendaRecarregarParcial() {
+  if (!agendaCache || agendaCache.concursoId !== state.currentConcursoId) { await agendaObter(); return; }
+  const ids = new Set(MATERIAS.map(m => m.id));
+  agendaCache.dados.topicos = (await dbGetAll("topicos")).filter(t => ids.has(t.materiaId));
+  agendaCache.agenda = await agendaLerAgenda();
+  agendaDerivar();
+}
+
+function agendaUnidade(item) {
+  const cl = agendaCache && agendaCache.cl;
+  if (!cl) return null;
+  let u = cl.porChave.get(item.chave);
+  if (!u && item.assuntoId != null) u = cl.porChave.get("a:" + item.assuntoId);
+  if (!u && item.topicoId != null) u = cl.porChave.get("t:" + item.topicoId);
+  return u || null;
+}
+
+/* ---------- ações: agendar, marcar como estudado, remover, mover ---------- */
+
+function agendaNovoUid() {
+  return "i" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+function agendaItensDoDia(dataKey) {
+  const rec = agendaCache.agenda[dataKey];
+  return rec ? rec.itens.map(i => ({ ...i })) : [];
+}
+
+async function agendaAdicionar(dataKey, chave, modalDia) {
+  const u = agendaCache.cl.porChave.get(chave);
+  if (!u) return;
+  const itens = agendaItensDoDia(dataKey);
+  if (itens.some(i => i.chave === chave)) { showToast("Esse assunto já está neste dia."); return; }
+  itens.push({
+    uid: agendaNovoUid(), chave, assuntoId: u.assuntoId, topicoId: u.topicoId,
+    materiaId: u.materiaId, nome: u.nome, feito: false, feitoEm: null,
+  });
+  await agendaSalvarDia(dataKey, itens);
+  await agendaRefrescar(modalDia);
+}
+
+async function agendaRemover(dataKey, uid, modalDia) {
+  const itens = agendaItensDoDia(dataKey).filter(i => i.uid !== uid);
+  await agendaSalvarDia(dataKey, itens);
+  await agendaRefrescar(modalDia);
+}
+
+async function agendaMover(dataKey, uid, destinoKey, modalDia) {
+  const origem = agendaItensDoDia(dataKey);
+  const item = origem.find(i => i.uid === uid);
+  if (!item) return;
+  await agendaSalvarDia(dataKey, origem.filter(i => i.uid !== uid));
+  const destino = agendaItensDoDia(destinoKey);
+  if (!destino.some(i => i.chave === item.chave)) destino.push(item);
+  await agendaSalvarDia(destinoKey, destino);
+  await agendaRefrescar(modalDia);
+}
+
+// marcar como estudado também marca o tópico no checklist do edital (e desmarcar desfaz)
+async function agendaMarcarFeito(dataKey, uid, feito, modalDia) {
+  const itens = agendaItensDoDia(dataKey);
+  const item = itens.find(i => i.uid === uid);
+  if (!item) return;
+  item.feito = feito;
+  item.feitoEm = feito ? Date.now() : null;
+  await agendaSalvarDia(dataKey, itens);
+
+  const u = agendaUnidade(item);
+  if (u && u.topicoId != null) {
+    const outroFeito = Object.keys(agendaCache.agenda).some(dk =>
+      agendaCache.agenda[dk].itens.some(i => i.chave === item.chave && i.feito && !(dk === dataKey && i.uid === uid)));
+    if (feito || !outroFeito) {
+      const t = await dbGet("topicos", u.topicoId);
+      if (t) { t.concluido = feito; await dbPut("topicos", t); }
+    }
+  }
+  if (feito) showToast("Marcado como estudado. As revisões entram a partir de amanhã.");
+  await agendaRefrescar(modalDia);
+}
+
+// atualiza as telas que estiverem visíveis
+async function agendaRefrescar(modalDia) {
+  await agendaRecarregarParcial();
+  if (!document.getElementById("view-calendario").hidden) await renderCalendario(false);
+  if (!document.getElementById("view-home").hidden) await renderPlanoHoje(true);
+  if (!document.getElementById("view-roteiro").hidden) await renderPlanoSemana(true);
+}
+
+async function agendaAbrir(chave, aba) {
+  const u = agendaCache && agendaCache.cl.porChave.get(chave);
+  if (!u) { showToast("Esse assunto não existe mais."); return; }
+  ativarConcursoDaMateria(u.materiaId);
+  state.currentMateriaId = u.materiaId;
+  if (!u.assuntoId) {
+    await goToMateria(u.materiaId);
+    showToast("Este tópico ainda não tem assunto. Crie um para guardar material, questões e flashcards.");
+    return;
+  }
+  await goToAssunto(u.assuntoId);
+  if (aba === "questoes" || aba === "flashcards") setActiveTab(aba);
+}
+
+/* ---------- pedaços de HTML reaproveitados (cartão de hoje, modal do dia) ---------- */
+
+function agendaSlotEstudo(dk, it, opc = {}) {
+  const u = agendaUnidade(it);
+  const mat = u ? u.materia : getMateriaById(it.materiaId);
+  const nome = planoNomeCurto(u ? u.nome : it.nome);
+  let sub = mat ? mat.nome : "";
+  if (!u) sub += " · assunto removido";
+  else if (opc.atrasado) sub += ` · era para ${calFmtData(dk)}`;
+  return `
+    <div class="plano-slot ${it.feito ? "feito" : ""}">
+      <input type="checkbox" class="plano-check" data-acao="check" data-dia="${dk}" data-uid="${it.uid}" ${it.feito ? "checked" : ""} title="Marcar como estudado">
+      <div class="plano-slot-corpo">
+        <span class="plano-slot-tipo">📖 Estudar</span>
+        <span class="plano-slot-nome">${escapeHTML(nome)}${u && u.prioritaria ? ` <span class="plano-prio" title="Matéria prioritária">⭐</span>` : ""}</span>
+        <span class="plano-slot-sub">${escapeHTML(sub)}</span>
+      </div>
+      <div class="plano-slot-acoes">
+        ${opc.atrasado ? `<button type="button" class="btn-secondary" data-acao="mover" data-dia="${dk}" data-uid="${it.uid}">Mover p/ hoje</button>` : ""}
+        ${u ? `<button type="button" class="btn-secondary plano-abrir" data-acao="abrir" data-chave="${escapeHTML(u.chave)}" data-aba="materiais">Abrir</button>` : ""}
+        ${opc.remover ? `<button type="button" class="btn-icon" data-acao="remover" data-dia="${dk}" data-uid="${it.uid}" title="Tirar deste dia">✕</button>` : ""}
+      </div>
+    </div>`;
+}
+
+function agendaSlotRevisao(tipo, g) {
+  const icone = tipo === "q" ? "❓" : "🃏";
+  const titulo = tipo === "q" ? "Resolver questões" : "Revisar flashcards";
+  const total = tipo === "q" ? (g.n === 1 ? "1 questão" : `${g.n} questões`) : (g.n === 1 ? "1 cartão" : `${g.n} cartões`);
+  const partes = [total];
+  const rever = g.n - g.novos;
+  if (g.novos > 0) partes.push(tipo === "q" ? `${g.novos} sem responder` : `${g.novos} novos`);
+  if (rever > 0) partes.push(`${rever} para rever`);
+  if (g.atrasadas > 0) partes.push(`${g.atrasadas} atrasados`);
+  if (g.projetados > 0) partes.push("previsto: depende de você estudar o assunto");
+  const u = g.u;
+  return `
+    <div class="plano-slot ${g.projetados === g.n ? "previsto" : ""}">
+      <div class="plano-slot-corpo">
+        <span class="plano-slot-tipo">${icone} ${titulo}</span>
+        <span class="plano-slot-nome">${escapeHTML(planoNomeCurto(u.nome))}${u.prioritaria ? ` <span class="plano-prio" title="Matéria prioritária">⭐</span>` : ""}</span>
+        <span class="plano-slot-sub">${escapeHTML(u.materia.nome)} · ${escapeHTML(partes.join(" · "))}</span>
+      </div>
+      <div class="plano-slot-acoes">
+        <button type="button" class="btn-secondary plano-abrir" data-acao="abrir" data-chave="${escapeHTML(u.chave)}" data-aba="${tipo === "q" ? "questoes" : "flashcards"}">Abrir</button>
+      </div>
+    </div>`;
+}
+
+function agendaGruposOrdenados(mapa) {
+  return [...mapa.values()].sort((a, b) => (b.u.prioritaria - a.u.prioritaria) || (b.n - a.n));
+}
+
+// liga os botões/checkboxes que tenham data-acao dentro de "raiz"
+function agendaLigarEventos(raiz, modalDia) {
+  raiz.querySelectorAll("[data-acao]").forEach(el => {
+    const acao = el.dataset.acao;
+    el.addEventListener(acao === "check" ? "change" : "click", async () => {
+      const { dia, uid, chave, aba } = el.dataset;
+      try {
+        if (acao === "check") await agendaMarcarFeito(dia, uid, el.checked, modalDia);
+        else if (acao === "remover") await agendaRemover(dia, uid, modalDia);
+        else if (acao === "agendar") await agendaAdicionar(dia, chave, modalDia);
+        else if (acao === "mover") await agendaMover(dia, uid, planoChaveData(inicioDoDia(0)), modalDia);
+        else if (acao === "abrir") { closeModal(); await agendaAbrir(chave, aba); }
+      } catch (err) {
+        console.error("Erro no calendário:", err);
+        showToast("Algo deu errado. Tente de novo.");
+      }
+    });
+  });
+}
+
+/* ============================================================
+   PLANO DA SEMANA
+   Como funciona:
+   - Para cada dia da semana (Domingo a Sábado) você escolhe 2 ou 3 matérias.
+     Fica salvo no banco do app (store "cronograma") e entra no backup.
+   - Para cada matéria do dia, o app sugere 1 ou 2 assuntos:
+       · um assunto JÁ ESTUDADO com questões/flashcards pendentes
+         (❓ resolver questões e/ou 🃏 revisar flashcards);
+       · o PRÓXIMO assunto novo da matéria (📖 estudar), na ordem do edital.
+   - As quantidades sugeridas são limitadas (PLANO_SUG_Q e PLANO_SUG_F), então
+     você faz "um pedaço" de cada assunto e não precisa zerar tudo no mesmo dia.
+   ============================================================ */
+
+const PLANO_MAX_MATERIAS = 3;   // máximo de matérias por dia
+const PLANO_MAX_ASSUNTOS = 2;   // assuntos sugeridos por matéria
+const PLANO_SUG_Q = 10;         // questões sugeridas por assunto
+const PLANO_SUG_F = 20;         // flashcards sugeridos por assunto
+
+let planoDiaSel = null;         // 0 (Domingo) a 6 (Sábado): dia aberto na tela
+
+/* ---------- banco: matérias de cada dia ---------- */
+
+// devolve { 0: [idsMateria], ... } só com as matérias do roteiro atual
+async function cronogramaLer() {
+  const ids = new Set(MATERIAS.map(m => m.id));
+  const mapa = {};
+  for (const r of await dbGetAll("cronograma")) {
+    mapa[r.dia] = (r.materiaIds || []).filter(id => ids.has(id));
+  }
+  return mapa;
+}
+
+// salva as matérias do dia sem mexer nas de outros roteiros
+async function cronogramaSalvarDia(dia, materiaIds) {
+  const atuais = new Set(MATERIAS.map(m => m.id));
+  const antigo = await dbGet("cronograma", dia);
+  const deOutrosRoteiros = ((antigo && antigo.materiaIds) || []).filter(id => !atuais.has(id));
+  const todos = [...deOutrosRoteiros, ...materiaIds];
+  if (todos.length) await dbPut("cronograma", { dia, materiaIds: todos });
+  else await dbDelete("cronograma", dia);
+}
+
+function planoMateriasDoDia(mapa, dia) {
+  const ids = new Set(mapa[dia] || []);
+  return MATERIAS.filter(m => ids.has(m.id));
+}
+
+/* ---------- o que está pendente em cada assunto ---------- */
+
+function planoPendencias(u) {
+  const hoje = inicioDoDia(0);
+  let qNovas = 0, qRever = 0, qErradas = 0;
+  for (const q of u.questoes) {
+    const t = q.tentativas || [];
+    if (!t.length) { qNovas++; continue; }
+    let streak = 0;
+    for (let i = t.length - 1; i >= 0 && t[i].acertou; i--) streak++;
+    const due = calSomaDias(calDiaInicio(t[t.length - 1].em), agendaIntervaloQuestao(streak));
+    if (due <= hoje) {
+      qRever++;
+      if (!t[t.length - 1].acertou) qErradas++;
+    }
+  }
+  let fNovos = 0, fRever = 0;
+  for (const c of u.flashcards) {
+    if (!c.revisoes) fNovos++;
+    else if (calDiaInicio(c.proximaRevisao ?? 0) <= hoje) fRever++;
+  }
+  return { qNovas, qRever, qErradas, q: qNovas + qRever, fNovos, fRever, f: fNovos + fRever };
+}
+
+// o que está vencido pesa mais do que o que ainda não foi visto
+function planoPeso(p) {
+  return (p.qRever + p.fRever) * 2 + p.qNovas + p.fNovos;
+}
+
+// Posição "do dia" dentro do ciclo da matéria.
+// Cada vez que a matéria aparece no plano (em qualquer dia da semana) ela avança uma posição
+// no ciclo, e a semana seguinte continua de onde parou. Assim, dois dias com Direito
+// Constitucional nunca mostram o mesmo assunto, e todos os já estudados vão passando por turno.
+function planoPosicaoCiclo(materiaId, dia, mapa) {
+  const dias = [];
+  for (let d = 0; d < 7; d++) if ((mapa[d] || []).includes(materiaId)) dias.push(d);
+  const k = Math.max(dias.length, 1);
+  const s = Math.max(dias.indexOf(dia), 0);
+  const domingo = inicioDoDia(-new Date().getDay());
+  const semana = Math.round(domingo / 86400000 / 7);
+  return semana * k + s;
+}
+
+// escolhe 1 ou 2 assuntos da matéria para o dia (revisão em rodízio entre os já estudados)
+function planoSugerirMateria(info, posicao = 0) {
+  const novo = info.proximo;
+  const porDia = novo ? 1 : PLANO_MAX_ASSUNTOS;
+
+  // lista estável (ordem do edital) de assuntos já estudados que têm questões ou flashcards
+  const ciclo = info.lista
+    .filter(u => u.assuntoId && u.estudado && (u.questoes.length + u.flashcards.length) > 0)
+    .sort((a, b) => a.ordem - b.ordem);
+
+  const itens = [];
+  if (ciclo.length) {
+    const ini = (posicao * porDia) % ciclo.length;
+    const girado = ciclo.slice(ini).concat(ciclo.slice(0, ini));
+    const praticar = girado
+      .map(u => ({ u, p: planoPendencias(u) }))
+      .filter(x => x.p.q + x.p.f > 0)       // pula quem não tem nada pendente
+      .slice(0, porDia);
+    for (const x of praticar) itens.push({ tipo: "praticar", u: x.u, p: x.p });
+  }
+
+  if (novo) itens.push({ tipo: "novo", u: novo, p: novo.assuntoId ? planoPendencias(novo) : null });
+
+  return itens.slice(0, PLANO_MAX_ASSUNTOS);
+}
+
+/* ---------- marcar o assunto novo como estudado ---------- */
+
+async function planoMarcarEstudado(chave) {
+  const dk = planoChaveData(inicioDoDia(0));
+  const achar = () => ((agendaCache.agenda[dk] && agendaCache.agenda[dk].itens) || []).find(i => i.chave === chave);
+  let it = achar();
+  if (!it) {
+    await agendaAdicionar(dk, chave, null); // já recarrega o cache e as telas
+    it = achar();
+  }
+  if (it) await agendaMarcarFeito(dk, it.uid, true, null);
+}
+
+/* ---------- to-do do plano: caixinha "concluído" de questões e flashcards ---------- */
+// guardado no aparelho (localStorage), por data real e por assunto: { "2026-10-26": ["chave|q", ...] }
+const PLANO_FEITOS_KEY = "caderno-plano-feitos";
+
+function planoFeitosLer() {
+  try { return JSON.parse(localStorage.getItem(PLANO_FEITOS_KEY)) || {}; } catch (e) { return {}; }
+}
+
+function planoFeitoEsta(dk, id) {
+  return (planoFeitosLer()[dk] || []).includes(id);
+}
+
+function planoFeitoSet(dk, id, feito) {
+  try {
+    const todos = planoFeitosLer();
+    const lista = new Set(todos[dk] || []);
+    if (feito) lista.add(id); else lista.delete(id);
+    if (lista.size) todos[dk] = [...lista]; else delete todos[dk];
+    const limite = planoChaveData(inicioDoDia(-45)); // limpa datas antigas
+    for (const k of Object.keys(todos)) if (k < limite) delete todos[k];
+    localStorage.setItem(PLANO_FEITOS_KEY, JSON.stringify(todos));
+  } catch (e) { console.warn("Não foi possível salvar o check do plano:", e); }
+}
+
+// true se o assunto foi marcado como estudado (feito) na agenda do dia "dk"
+function agendaFeitoHoje(chave, dk) {
+  const rec = agendaCache && agendaCache.agenda[dk];
+  return !!(rec && rec.itens.some(i => i.chave === chave && i.feito));
+}
+
+// marca/desmarca o assunto como estudado hoje (atualiza o checklist do edital e o "próximo assunto")
+async function planoAlternarEstudado(chave, feito) {
+  if (feito) { await planoMarcarEstudado(chave); return; }
+  for (const dk of Object.keys(agendaCache.agenda)) {
+    const it = agendaCache.agenda[dk].itens.find(i => i.chave === chave && i.feito);
+    if (it) { await agendaMarcarFeito(dk, it.uid, false, null); }
+  }
+}
+
+/* ---------- HTML da sugestão (usado no plano da semana e na tela inicial) ---------- */
+
+function planoPlural(n, singular, plural) {
+  return `${n} ${n === 1 ? singular : plural}`;
+}
+
+function planoAcaoHTML(icone, titulo, detalhe, check) {
+  // check (opcional): { dk, id, feito } -> caixinha de concluído; a linha inteira fica verde
+  const box = check
+    ? (check.estudo
+        ? `<input type="checkbox" class="plano-feito-check" data-estudo-chave="${escapeHTML(check.estudo)}" ${check.feito ? "checked" : ""} title="Marcar assunto como estudado" aria-label="Marcar assunto como estudado">`
+        : `<input type="checkbox" class="plano-feito-check" data-feito-dk="${check.dk}" data-feito-id="${escapeHTML(check.id)}" ${check.feito ? "checked" : ""} title="Marcar como concluído" aria-label="Marcar como concluído">`)
+    : "";
+  return `
+    <div class="sem-acao${check && check.feito ? " feito" : ""}">
+      ${box}
+      <span class="sem-acao-ico" aria-hidden="true">${icone}</span>
+      <div class="sem-acao-txt">
+        <b>${titulo}</b>
+        ${detalhe ? `<small>${escapeHTML(detalhe)}</small>` : ""}
+      </div>
+    </div>`;
+}
+
+function planoItemHTML(it, totais, dk) {
+  const u = it.u, p = it.p;
+  const nome = escapeHTML(planoNomeCurto(u.nome));
+  const chave = escapeHTML(u.chave);
+  const chk = (tipo) => { const id = it.u.chave + "|" + tipo; return { dk, id, feito: planoFeitoEsta(dk, id) }; };
+
+  if (it.tipo === "praticar") {
+    let acoes = "";
+    if (p.q > 0) {
+      const n = Math.min(p.q, PLANO_SUG_Q);
+      totais.q += n;
+      const partes = [];
+      if (p.qRever) partes.push(`${p.qRever} para rever${p.qErradas ? ` (${p.qErradas} que você errou)` : ""}`);
+      if (p.qNovas) partes.push(`${p.qNovas} sem responder`);
+      acoes += planoAcaoHTML("❓", `Resolver ${planoPlural(n, "questão", "questões")}`,
+        `${p.q > n ? `de ${p.q} · ` : ""}${partes.join(" · ")}`, chk("q"));
+    }
+    if (p.f > 0) {
+      const n = Math.min(p.f, PLANO_SUG_F);
+      totais.f += n;
+      const partes = [];
+      if (p.fRever) partes.push(`${p.fRever} para rever`);
+      if (p.fNovos) partes.push(`${p.fNovos} novos`);
+      acoes += planoAcaoHTML("🃏", `Revisar ${planoPlural(n, "flashcard", "flashcards")}`,
+        `${p.f > n ? `de ${p.f} · ` : ""}${partes.join(" · ")}`, chk("f"));
+    }
+    return `<div class="sem-item"><div class="sem-item-nome">${nome}</div>${acoes}</div>`;
+  }
+
+  // assunto novo (ou já estudado hoje, mostrado marcado)
+  const feitoHoje = it.tipo === "feito-hoje";
+  if (!feitoHoje) totais.novos++;
+  const partes = [];
+  if (!u.assuntoId) partes.push("ainda sem assunto cadastrado");
+  else partes.push(u.nMat > 0 ? planoPlural(u.nMat, "material", "materiais") : "sem material ainda");
+  if (!feitoHoje) {
+    if (p && p.q) partes.push(`depois: ${planoPlural(p.q, "questão", "questões")}`);
+    if (p && p.f) partes.push(planoPlural(p.f, "flashcard", "flashcards"));
+  }
+  const abrir = u.assuntoId
+    ? `<button type="button" class="btn-secondary plano-abrir" data-acao="abrir" data-chave="${chave}" data-aba="materiais" style="margin:4px 0 0 34px;">Abrir</button>`
+    : "";
+  return `<div class="sem-item novo"><div class="sem-item-nome">${nome}</div>${planoAcaoHTML("📖", feitoHoje ? "Assunto estudado" : "Estudar assunto novo", partes.join(" · "), { estudo: u.chave, feito: feitoHoje })}${abrir}</div>`;
+}
+
+function planoSugestaoHTML(materias, dia, mapa) {
+  const A = agendaCache;
+  const totais = { q: 0, f: 0, novos: 0 };
+  const dk = planoChaveData(inicioDoDia((dia ?? new Date().getDay()) - new Date().getDay())); // data real do dia mostrado
+
+  const blocos = materias.map(m => {
+    const info = A.cl.porMateria.get(m.id);
+    let itens = info ? planoSugerirMateria(info, planoPosicaoCiclo(m.id, dia, mapa || {})) : [];
+    if (info && dk === planoChaveData(inicioDoDia(0))) {
+      // o que você marcou como estudado hoje continua visível (marcado), com o próximo logo abaixo
+      const hojeTs = inicioDoDia(0);
+      const jaHoje = info.lista.filter(u => u.estudadoEm === hojeTs && agendaFeitoHoje(u.chave, dk))
+        .map(u => ({ tipo: "feito-hoje", u, p: null }));
+      itens = [...jaHoje, ...itens];
+    }
+    const corpo = itens.length
+      ? itens.map(it => planoItemHTML(it, totais, dk)).join("")
+      : `<p class="sem-vazio">Nada pendente nesta matéria. Cadastre assuntos, questões ou flashcards para receber sugestões.</p>`;
+    return `
+      <section class="sem-mat" style="--c:${escapeHTML(m.cor || "#7C5CFC")}">
+        <h4 class="sem-mat-nome">${escapeHTML(m.icone || "📘")} ${escapeHTML(m.nome)}${planoMateriaPrioritaria(m) ? ` <span class="plano-prio" title="Matéria prioritária">⭐</span>` : ""}</h4>
+        ${corpo}
+      </section>`;
+  }).join("");
+
+  const resumo = [];
+  if (totais.q) resumo.push(`❓ ${planoPlural(totais.q, "questão", "questões")}`);
+  if (totais.f) resumo.push(`🃏 ${planoPlural(totais.f, "flashcard", "flashcards")}`);
+  if (totais.novos) resumo.push(`📖 ${planoPlural(totais.novos, "assunto novo", "assuntos novos")}`);
+
+  return `
+    ${resumo.length ? `<p class="sem-resumo">Sugestão do dia: ${resumo.join(" · ")}</p>` : ""}
+    <div class="sem-mats">${blocos}</div>`;
+}
+
+function planoLigarEventos(raiz) {
+  raiz.querySelectorAll("[data-feito-id]").forEach(cb => {
+    cb.addEventListener("change", () => {
+      planoFeitoSet(cb.dataset.feitoDk, cb.dataset.feitoId, cb.checked);
+      const linha = cb.closest(".sem-acao");
+      if (linha) linha.classList.toggle("feito", cb.checked);
+    });
+  });
+  raiz.querySelectorAll("[data-estudo-chave]").forEach(cb => {
+    cb.addEventListener("change", async () => {
+      try { await planoAlternarEstudado(cb.dataset.estudoChave, cb.checked); }
+      catch (err) { console.error("Erro ao marcar estudado:", err); showToast("Algo deu errado. Tente de novo."); }
+    });
+  });
+  raiz.querySelectorAll("[data-acao]").forEach(el => {
+    el.addEventListener("click", async () => {
+      const { acao, chave, aba } = el.dataset;
+      try {
+        if (acao === "abrir") await agendaAbrir(chave, aba);
+        else if (acao === "estudado") await planoMarcarEstudado(chave);
+      } catch (err) {
+        console.error("Erro no plano da semana:", err);
+        showToast("Algo deu errado. Tente de novo.");
+      }
+    });
+  });
+}
+
+/* ---------- PLANO DA SEMANA (tela) ---------- */
+
+async function goToCalendario() {
+  state.currentMateriaId = null;
+  state.currentAssuntoId = null;
+  const c = getConcursoAtual();
+  document.getElementById("app-title").textContent = c ? `📅 Plano da semana — ${c.nome}` : "📅 Plano da semana";
+  showView("view-calendario");
+  planoDiaSel = new Date().getDay();
+  await renderCalendario(true);
+}
+
+document.getElementById("btn-calendario").addEventListener("click", goToCalendario);
+
+async function renderCalendario(recarregar) {
+  const el = document.getElementById("calendario-container");
+  if (!getConcursoAtual() || MATERIAS.length === 0) {
+    el.innerHTML = `
+      <div class="empty-state">
+        <span class="empty-emoji">📅</span>
+        <p>Crie um roteiro com matérias para montar o plano da semana.</p>
+      </div>`;
+    return;
+  }
+  if (recarregar || !agendaCache || agendaCache.concursoId !== state.currentConcursoId) await agendaObter();
+  const mapa = await cronogramaLer();
+  const hojeDia = new Date().getDay();
+  if (planoDiaSel === null) planoDiaSel = hojeDia;
+  const dia = planoDiaSel;
+
+  const tira = DIAS_CURTOS.map((nome, i) => {
+    const mats = planoMateriasDoDia(mapa, i);
+    const minis = mats.map(m =>
+      `<span class="sem-mini" style="--c:${escapeHTML(m.cor || "#7C5CFC")}" title="${escapeHTML(m.nome)}"><span class="sem-mini-txt">${escapeHTML(m.nome)}</span></span>`).join("");
+    return `
+      <button type="button" class="sem-dia ${i === dia ? "sel" : ""} ${i === hojeDia ? "hoje" : ""}" data-dia="${i}" aria-pressed="${i === dia}">
+        <span class="sem-dia-nome">${nome}</span>
+        <span class="sem-dia-mats">${minis || `<span class="sem-dia-vazio">—</span>`}</span>
+      </button>`;
+  }).join("");
+
+  const mats = planoMateriasDoDia(mapa, dia);
+  const chips = mats.map(m =>
+    `<span class="sem-chip" style="--c:${escapeHTML(m.cor || "#7C5CFC")}">${escapeHTML(m.icone || "📘")} ${escapeHTML(m.nome)}</span>`).join("");
+
+  let corpo;
+  if (!mats.length) {
+    corpo = `
+      <div class="empty-state sem-vazio-dia">
+        <span class="empty-emoji">🗓️</span>
+        <p>Nenhuma matéria escolhida para ${DIAS_SEMANA[dia].toLowerCase()}.</p>
+        <p>Escolha 2 ou 3 e o app sugere o que fazer em cada uma.</p>
+      </div>`;
+  } else {
+    corpo = planoSugestaoHTML(mats, dia, mapa);
+  }
+
+  el.innerHTML = `
+    <p class="view-subtitle">Escolha as matérias de cada dia. O app sugere questões, flashcards ou um assunto novo, só de 1 ou 2 assuntos por matéria.</p>
+    <div class="sem-tira">${tira}</div>
+    <div class="sem-painel">
+      <div class="sem-painel-topo">
+        <h3 class="sem-painel-titulo">${DIAS_SEMANA[dia]}${dia === hojeDia ? ` <span class="sem-tag-hoje">hoje</span>` : ""}</h3>
+        <button type="button" class="${mats.length ? "btn-secondary" : "btn-primary"}" id="sem-editar">${mats.length ? "Trocar matérias" : "Escolher matérias"}</button>
+      </div>
+      ${chips ? `<div class="sem-chips">${chips}</div>` : ""}
+      ${corpo}
+      ${mats.length && dia !== hojeDia ? `<p class="view-subtitle sem-nota">A sugestão usa o que está pendente agora e pode mudar até lá.</p>` : ""}
+    </div>`;
+
+  el.querySelectorAll(".sem-dia").forEach(b => {
+    b.addEventListener("click", () => {
+      planoDiaSel = Number(b.dataset.dia);
+      renderCalendario(false);
+    });
+  });
+  document.getElementById("sem-editar").addEventListener("click", () => abrirModalMateriasDia(dia, mapa[dia] || []));
+  planoLigarEventos(el);
+}
+
+/* ---------- modal: escolher as matérias do dia ---------- */
+
+function abrirModalMateriasDia(dia, idsAtuais) {
+  const marcadas = new Set(idsAtuais.map(String));
+  openModal(`
+    <h3 class="modal-title">Matérias de ${DIAS_SEMANA[dia].toLowerCase()}</h3>
+    <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 12px;">
+      Escolha até ${PLANO_MAX_MATERIAS} matérias para este dia.
+    </p>
+    <div class="sem-escolha">
+      ${MATERIAS.map(m => `
+        <label class="sem-opcao" style="--c:${escapeHTML(m.cor || "#7C5CFC")}">
+          <input type="checkbox" value="${escapeHTML(String(m.id))}" ${marcadas.has(String(m.id)) ? "checked" : ""}>
+          <span class="sem-opcao-cor"></span>
+          <span class="sem-opcao-nome">${escapeHTML(m.icone || "📘")} ${escapeHTML(m.nome)}</span>
+        </label>`).join("")}
+    </div>
+    <p class="view-subtitle" id="sem-contador" style="margin:10px 0 0;"></p>
+    <div class="modal-actions">
+      <button type="button" class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
+      <button type="button" class="btn-primary" id="sem-salvar">Salvar</button>
+    </div>
+  `);
+
+  const box = document.getElementById("modal-box");
+  const checks = () => [...box.querySelectorAll(".sem-escolha input[type=checkbox]")];
+  const contador = document.getElementById("sem-contador");
+  const atualizar = () => {
+    const n = checks().filter(c => c.checked).length;
+    contador.textContent = `${n} de ${PLANO_MAX_MATERIAS} escolhidas`;
+  };
+  checks().forEach(c => c.addEventListener("change", () => {
+    if (checks().filter(x => x.checked).length > PLANO_MAX_MATERIAS) {
+      c.checked = false;
+      showToast(`Máximo de ${PLANO_MAX_MATERIAS} matérias por dia, para manter o foco.`);
+    }
+    atualizar();
+  }));
+  atualizar();
+
+  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+  document.getElementById("sem-salvar").addEventListener("click", async () => {
+    const escolhidas = new Set(checks().filter(c => c.checked).map(c => c.value));
+    const ids = MATERIAS.filter(m => escolhidas.has(String(m.id))).map(m => m.id);
+    try {
+      await cronogramaSalvarDia(dia, ids);
+      closeModal();
+      await renderCalendario(false);
+      showToast("Matérias salvas.");
+    } catch (err) {
+      console.error(err);
+      showToast("Não foi possível salvar.");
+    }
+  });
+}
+
+/* ---------- CARTÃO "HOJE" (tela inicial) ---------- */
+
+async function renderPlanoHoje(usarCache) {
+  const el = document.getElementById("plano-hoje");
+  if (!el) return;
+  if (!getConcursoAtual() || MATERIAS.length === 0) { el.innerHTML = ""; return; }
+  if (!usarCache || !agendaCache || agendaCache.concursoId !== state.currentConcursoId) await agendaObter();
+
+  const dia = new Date().getDay();
+  const mapa = await cronogramaLer();
+  const mats = planoMateriasDoDia(mapa, dia);
+  const temPlano = Object.values(mapa).some(l => l.length);
+
+  let corpo;
+  if (!mats.length) {
+    corpo = `
+      <p class="view-subtitle" style="margin:4px 0 10px;">
+        ${temPlano
+          ? `Você ainda não escolheu as matérias de ${DIAS_SEMANA[dia].toLowerCase()}.`
+          : "Monte sua semana: escolha 2 ou 3 matérias por dia e o app sugere o que fazer."}
+      </p>
+      <button type="button" class="btn-primary" id="btn-plano-semana">Escolher matérias</button>`;
+  } else {
+    corpo = planoSugestaoHTML(mats, dia, mapa);
+  }
+
+  el.innerHTML = `
+    <div class="plano-hoje-card">
+      <div class="plano-hoje-topo">
+        <span class="roteiro-banner-titulo">📅 Hoje · ${DIAS_SEMANA[dia]}</span>
+        ${mats.length ? `<button type="button" class="btn-ghost" id="btn-plano-semana">Plano da semana</button>` : ""}
+      </div>
+      ${corpo}
+    </div>`;
+  planoLigarEventos(el);
+  document.getElementById("btn-plano-semana").addEventListener("click", goToCalendario);
+}
+
+/* ---------- ROTEIRO: atalho para o plano da semana + próximos assuntos ---------- */
+
+async function renderPlanoSemana(usarCache) {
+  const el = document.getElementById("plano-semana");
+  if (!el) return;
+  if (!getConcursoAtual() || MATERIAS.length === 0) { el.innerHTML = ""; return; }
+  if (!usarCache || !agendaCache || agendaCache.concursoId !== state.currentConcursoId) await agendaObter();
+  const A = agendaCache;
+  const itens = A.cl.proximos.map(u =>
+    `<li>${u.prioritaria ? "⭐ " : ""}${escapeHTML(planoNomeCurto(u.nome))} <small>${escapeHTML(u.materia.curto || u.materia.nome)}</small></li>`).join("");
+  el.innerHTML = `
+    <h3 class="roteiro-secao-titulo">📅 Plano da semana e próximos assuntos</h3>
+    <p class="view-subtitle" style="margin-bottom:12px;">
+      Escolha as matérias de cada dia da semana. O app sugere questões, flashcards ou um assunto novo para cada uma.
+    </p>
+    <button type="button" class="btn-primary" id="btn-abrir-calendario">📅 Abrir plano da semana</button>
+    <h4 style="margin:18px 0 4px; font-size:13.5px;">Próximo assunto de cada matéria</h4>
+    <p class="view-subtitle" style="margin:0 0 4px;">É o primeiro tópico ainda não marcado depois do último que você marcou no checklist. Ele só muda quando você marca um tópico como concluído.</p>
+    ${itens ? `<ul class="plano-lista">${itens}</ul>` : `<p class="view-subtitle">Tudo já foi estudado ou agendado.</p>`}`;
+  document.getElementById("btn-abrir-calendario").addEventListener("click", goToCalendario);
+}
+
+
+/* ============================================================
    11. BACKUP — EXPORTAR / IMPORTAR (JSON completo, com PDFs e imagens)
    ============================================================ */
 
@@ -3198,58 +4709,94 @@ function dbClear(storeName) {
   });
 }
 
-async function gerarBackupJSON() {
-  const assuntos = await dbGetAll("assuntos");
-  const materiaisRaw = await dbGetAll("materiais");
-  const questoesRaw = await dbGetAll("questoes");
-  const anotacoes = await dbGetAll("anotacoes");
-  const flashcards = await dbGetAll("flashcards");
-  const concursos = await dbGetAll("concursos");
-  const topicos = await dbGetAll("topicos");
-  const cronograma = await dbGetAll("cronograma");
-
-  const materiais = [];
-  for (const m of materiaisRaw) {
-    materiais.push({
-      ...m,
-      arquivo: m.arquivo ? await blobToBase64(m.arquivo) : null,
-    });
-  }
-
-  const questoes = [];
-  for (const q of questoesRaw) {
-    questoes.push({
-      ...q,
-      imagem: q.imagem ? await blobToBase64(q.imagem) : null,
-    });
-  }
-
+async function lerDadosBackupBruto() {
   return {
-    app: "caderno-estudos-concursos",
-    versao: 2,
-    exportadoEm: new Date().toISOString(),
-    dados: { assuntos, materiais, questoes, anotacoes, flashcards, concursos, topicos, cronograma },
+    assuntos: await dbGetAll("assuntos"),
+    materiais: await dbGetAll("materiais"),
+    questoes: await dbGetAll("questoes"),
+    anotacoes: await dbGetAll("anotacoes"),
+    flashcards: await dbGetAll("flashcards"),
+    concursos: await dbGetAll("concursos"),
+    topicos: await dbGetAll("topicos"),
+    cronograma: await dbGetAll("cronograma"),
+    agenda: await dbGetAll("agenda"),
   };
+}
+
+// Formato principal (v3): arquivo .zip com o backup.json (só texto/dados) + cada PDF e cada
+// imagem como arquivo separado. Assim nada vira uma string gigante (o JSON único estourava o
+// limite do navegador, ~512 MB, quando havia muitos PDFs/imagens) e o backup fica ~30% menor.
+async function gerarBackupZip() {
+  const d = await lerDadosBackupBruto();
+  const zip = new JSZip();
+
+  const separar = (lista, campo, pasta) => lista.map(item => {
+    const { [campo]: blob, ...resto } = item;
+    if (!blob) return { ...resto, [campo]: null };
+    const caminho = `arquivos/${pasta}/${item.id}`;
+    zip.file(caminho, blob, { compression: "STORE" }); // PDFs e imagens já são comprimidos
+    return { ...resto, [campo + "Ref"]: caminho, [campo + "Tipo"]: blob.type || "" };
+  });
+
+  const materiais = separar(d.materiais, "arquivo", "materiais");
+  const questoes = separar(d.questoes, "imagem", "questoes");
+
+  const backup = {
+    app: "caderno-estudos-concursos",
+    versao: 3,
+    exportadoEm: new Date().toISOString(),
+    dados: { assuntos: d.assuntos, materiais, questoes, anotacoes: d.anotacoes, flashcards: d.flashcards, concursos: d.concursos, topicos: d.topicos, cronograma: d.cronograma, agenda: d.agenda },
+  };
+  zip.file("backup.json", JSON.stringify(backup), { compression: "DEFLATE" });
+  return zip.generateAsync({ type: "blob", streamFiles: true });
+}
+
+// Reserva (sem internet para carregar o JSZip): .json montado em pedaços, sem criar uma única
+// string gigante. Para backups muito grandes prefira o .zip.
+async function gerarBackupJsonBlob() {
+  const d = await lerDadosBackupBruto();
+  const partes = [`{"app":"caderno-estudos-concursos","versao":2,"exportadoEm":${JSON.stringify(new Date().toISOString())},"dados":{`];
+  const comArquivos = async (lista, campo) => {
+    partes.push("[");
+    for (let i = 0; i < lista.length; i++) {
+      const { [campo]: blob, ...resto } = lista[i];
+      const base = JSON.stringify(resto).slice(0, -1); // tira a "}" final
+      partes.push((i ? "," : "") + base + `,${JSON.stringify(campo)}:`);
+      partes.push(blob ? JSON.stringify(await blobToBase64(blob)) : "null");
+      partes.push("}");
+    }
+    partes.push("]");
+  };
+  const simples = ["assuntos", "anotacoes", "flashcards", "concursos", "topicos", "cronograma", "agenda"];
+  partes.push(simples.map(k => `${JSON.stringify(k)}:${JSON.stringify(d[k])}`).join(",") + ",");
+  partes.push('"materiais":'); await comArquivos(d.materiais, "arquivo");
+  partes.push(',"questoes":'); await comArquivos(d.questoes, "imagem");
+  partes.push("}}");
+  return new Blob(partes, { type: "application/json" });
 }
 
 async function exportarBackup() {
   showToast("Gerando backup...");
   try {
-    const backup = await gerarBackupJSON();
-    const jsonStr = JSON.stringify(backup, null, 2);
-    const blob = new Blob([jsonStr], { type: "application/json" });
+    let usarZip = true;
+    try {
+      if (!window.JSZip) await carregarScriptExterno(ANKI_JSZIP_URL);
+    } catch (e) {
+      usarZip = false; // sem internet e a biblioteca ainda não está no cache
+    }
+    const blob = usarZip ? await gerarBackupZip() : await gerarBackupJsonBlob();
     const url = URL.createObjectURL(blob);
 
     const dataFormatada = new Date().toISOString().slice(0, 10);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `backup-caderno-estudos-${dataFormatada}.json`;
+    a.download = `backup-caderno-estudos-${dataFormatada}.${usarZip ? "zip" : "json"}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
 
-    showToast("Backup exportado com sucesso.");
+    showToast(usarZip ? "Backup exportado com sucesso." : "Backup exportado (.json, pois a biblioteca de .zip não carregou).");
   } catch (err) {
     console.error("Erro ao exportar backup:", err);
     showToast("Erro ao gerar o backup.");
@@ -3269,8 +4816,17 @@ document.getElementById("import-file-input").addEventListener("change", async (e
 
   let backup;
   try {
-    const texto = await file.text();
-    backup = JSON.parse(texto);
+    if (/\.zip$/i.test(file.name)) {
+      if (!window.JSZip) await carregarScriptExterno(ANKI_JSZIP_URL);
+      const zip = await JSZip.loadAsync(file);
+      const entrada = zip.file("backup.json");
+      if (!entrada) throw new Error("backup.json não encontrado no .zip");
+      backup = JSON.parse(await entrada.async("string"));
+      backup._zip = zip; // os PDFs e imagens são lidos daqui na hora de restaurar
+    } else {
+      const texto = await file.text();
+      backup = JSON.parse(texto);
+    }
   } catch (err) {
     showToast("Arquivo de backup inválido.");
     return;
@@ -3290,7 +4846,7 @@ function confirmarImportacao(backup) {
     <h3 class="modal-title">Importar backup?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 10px;">
       Esse arquivo contém <b>${assuntos.length}</b> assunto(s), <b>${materiais.length}</b> material(is),
-      <b>${questoes.length}</b> questão(ões), <b>${anotacoes.length}</b> anotação(ões) e <b>${flashcards.length}</b> flashcard(s).
+      <b>${questoes.length}</b> questão(ões) e <b>${flashcards.length}</b> flashcard(s).
     </p>
     <p style="font-size:13.5px; color:var(--danger); margin:0 0 4px;">
       ⚠️ Isso vai <b>substituir todos os dados atuais</b> do aplicativo. Essa ação não pode ser desfeita.
@@ -3305,6 +4861,19 @@ function confirmarImportacao(backup) {
     closeModal();
     await importarBackup(backup);
   });
+}
+
+// devolve o Blob de um PDF/imagem do backup: do .zip (v3) ou do base64 dentro do .json (v1/v2)
+async function blobDoBackup(backup, item, campo) {
+  const ref = item[campo + "Ref"];
+  if (ref && backup._zip) {
+    const f = backup._zip.file(ref);
+    if (!f) return null;
+    const blob = await f.async("blob");
+    const tipo = item[campo + "Tipo"];
+    return tipo ? blob.slice(0, blob.size, tipo) : blob;
+  }
+  return item[campo] ? base64ToBlob(item[campo]) : null;
 }
 
 async function importarBackup(backup) {
@@ -3322,16 +4891,12 @@ async function importarBackup(backup) {
       await dbPut("assuntos", a);
     }
     for (const m of materiais) {
-      await dbPut("materiais", {
-        ...m,
-        arquivo: m.arquivo ? await base64ToBlob(m.arquivo) : null,
-      });
+      const { arquivoRef, arquivoTipo, ...resto } = m;
+      await dbPut("materiais", { ...resto, arquivo: await blobDoBackup(backup, m, "arquivo") });
     }
     for (const q of questoes) {
-      await dbPut("questoes", {
-        ...q,
-        imagem: q.imagem ? await base64ToBlob(q.imagem) : null,
-      });
+      const { imagemRef, imagemTipo, ...resto } = q;
+      await dbPut("questoes", { ...resto, imagem: await blobDoBackup(backup, q, "imagem") });
     }
     for (const n of anotacoes) {
       await dbPut("anotacoes", n);
@@ -3341,7 +4906,7 @@ async function importarBackup(backup) {
     }
 
     // roteiros, checklist e cronograma (backups antigos não têm; nesse caso mantém os atuais)
-    const { concursos, topicos, cronograma } = backup.dados;
+    const { concursos, topicos, cronograma, agenda } = backup.dados;
     if (Array.isArray(concursos)) {
       await dbClear("concursos");
       for (const c of concursos) await dbPut("concursos", c);
@@ -3354,6 +4919,11 @@ async function importarBackup(backup) {
       await dbClear("cronograma");
       for (const d of cronograma) await dbPut("cronograma", d);
     }
+    if (Array.isArray(agenda)) {
+      await dbClear("agenda");
+      for (const r of agenda) await dbPut("agenda", r);
+    }
+    agendaCache = null;
     await carregarConcursos();
 
     showToast("Backup importado com sucesso.");
@@ -3425,6 +4995,13 @@ function ankiTextoParaHtml(texto) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
+    .replace(/\r?\n/g, "<br>");
+}
+
+// texto com marcas (**negrito**, *itálico*, ==destaque==) -> HTML do Anki
+function ankiTextoRicoParaHtml(texto) {
+  return formatarTextoRico(texto)
+    .replace(/<mark>/g, '<mark style="background:#ffe96b;color:#000">')
     .replace(/\r?\n/g, "<br>");
 }
 
@@ -3632,10 +5209,10 @@ async function coletarNotasAnki({ somenteConcursoAtual, incluirFlash, incluirQue
         }
 
         let verso = (q.resposta || "").trim()
-          ? ankiTextoParaHtml(q.resposta.trim())
+          ? ankiTextoRicoParaHtml(q.resposta.trim())
           : "<i>(sem resposta registrada)</i>";
         if ((q.comentario || "").trim()) {
-          verso += `<div class="comentario">${ankiTextoParaHtml(q.comentario.trim())}</div>`;
+          verso += `<div class="comentario">${ankiTextoRicoParaHtml(q.comentario.trim())}</div>`;
         }
 
         const tagsQ = [...tags, "questao"];
@@ -4161,7 +5738,7 @@ function pdfMontarQuestoes(doc, itens, { titulo, subtitulo, umaPorPagina, inclui
   });
 }
 
-async function gerarPdfQuestoes({ assuntoId, escopo, incluirTexto, umaPorPagina, onProgresso }) {
+async function gerarPdfQuestoes({ assuntoId, escopo, incluirTexto, umaPorPagina, onProgresso, selecao = null, descAbas = "", sufixoAbas = "" }) {
   const JsPDF = await carregarJsPDF();
   const assunto = await dbGet("assuntos", assuntoId);
   const materia = assunto ? getMateriaById(assunto.materiaId) : null;
@@ -4172,18 +5749,32 @@ async function gerarPdfQuestoes({ assuntoId, escopo, incluirTexto, umaPorPagina,
     assuntos.sort((a, b) => (a.ordem ?? a.criadoEm ?? a.id) - (b.ordem ?? b.criadoEm ?? b.id));
   }
 
+  // fontes: de onde vêm as questões (abas escolhidas na tela, ou assuntos inteiros)
+  const fontes = [];
+  if (escopo === "assunto" && selecao && selecao.length) {
+    const lista = [];
+    for (const sel of selecao) {
+      const q = await dbGet("questoes", sel.id);
+      if (q) lista.push({ q, numero: sel.numero });
+    }
+    fontes.push({ ass: assunto, lista });
+  } else {
+    for (const ass of assuntos) {
+      const questoes = await getQuestoesOrdenadas(ass.id);
+      fontes.push({ ass, lista: questoes.map((q, i) => ({ q, numero: i + 1 })) });
+    }
+  }
+
   const itens = [];
   let comImagem = 0;
-  for (const ass of assuntos) {
-    const questoes = await getQuestoesOrdenadas(ass.id);
-    for (let i = 0; i < questoes.length; i++) {
-      const q = questoes[i];
+  for (const { ass, lista } of fontes) {
+    for (const { q, numero } of lista) {
       const temTexto = !!((q.resposta || "").trim() || (q.comentario || "").trim());
       if (!q.imagem && !(incluirTexto && temTexto)) continue;
       const item = {
         grupo: escopo === "materia" ? pdfLimparTexto(ass.nome) : null,
-        rotulo: `Questao ${i + 1}`,
-        img: null, resposta: q.resposta, comentario: q.comentario,
+        rotulo: `Questao ${numero}`,
+        img: null, resposta: semMarcacao(q.resposta), comentario: semMarcacao(q.comentario),
       };
       if (q.imagem) {
         try {
@@ -4205,7 +5796,7 @@ async function gerarPdfQuestoes({ assuntoId, escopo, incluirTexto, umaPorPagina,
   const hoje = new Date().toLocaleDateString("pt-BR");
   pdfMontarQuestoes(doc, itens, {
     titulo: pdfLimparTexto(nomeBase) || "Questoes",
-    subtitulo: `${materia && escopo !== "materia" ? pdfLimparTexto(materia.nome) + "  |  " : ""}${itens.length} questao(oes)  |  ${hoje}`,
+    subtitulo: `${materia && escopo !== "materia" ? pdfLimparTexto(materia.nome) + "  |  " : ""}${descAbas ? descAbas + "  |  " : ""}${itens.length} questao(oes)  |  ${hoje}`,
     umaPorPagina, incluirTexto,
   });
 
@@ -4219,27 +5810,48 @@ async function gerarPdfQuestoes({ assuntoId, escopo, incluirTexto, umaPorPagina,
 
   return {
     blob: doc.output("blob"),
-    nomeArquivo: `questoes-${pdfSlug(nomeBase)}-${new Date().toISOString().slice(0, 10)}.pdf`,
+    nomeArquivo: `questoes-${pdfSlug(nomeBase)}${sufixoAbas ? "-" + sufixoAbas : ""}-${new Date().toISOString().slice(0, 10)}.pdf`,
     quantidade: itens.length,
     comImagem,
   };
 }
 
 function abrirModalExportarPdfQuestoes(assuntoId) {
+  // as abas seguem o que está na tela (filtros e ordem atuais)
+  const tela = state.questoesTela && state.questoesTela.assuntoId === assuntoId ? state.questoesTela.itens : [];
+  const totalAbas = Math.ceil(tela.length / QUESTOES_POR_PAGINA);
+  const abasHTML = Array.from({ length: totalAbas }, (_, k) => {
+    const p = k + 1;
+    const ini = k * QUESTOES_POR_PAGINA + 1;
+    const fim = Math.min(tela.length, p * QUESTOES_POR_PAGINA);
+    return `<label class="pdfq-aba">
+      <input type="checkbox" class="pdfq-aba-check" value="${p}" ${p === state.currentPagina ? "checked" : ""}>
+      <span><b>Aba ${p}</b><br><small>questões ${ini}–${fim}</small></span>
+    </label>`;
+  }).join("");
+
   openModal(`
     <h3 class="modal-title">Exportar questões em PDF</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 14px;">
-      Todas as imagens das questões juntas em um único PDF, na ordem em que foram cadastradas
-      (os filtros da tela não são aplicados).
+      Escolha quais abas (de ${QUESTOES_POR_PAGINA} questões) vão para o PDF. A aba em que você está já vem marcada.
+      As abas seguem o que aparece na tela, com os filtros e a ordem atuais.
     </p>
     <div class="modal-field">
       <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
-        <input type="radio" name="pdfq-escopo" value="assunto" checked> Só este assunto
+        <input type="radio" name="pdfq-escopo" value="assunto" checked> Abas deste assunto
       </label>
+    </div>
+    <div id="pdfq-abas-box" class="modal-field">
+      ${totalAbas ? `
+        <div class="pdfq-abas-acoes">
+          <button type="button" class="btn-ghost" id="pdfq-todas">Marcar todas</button>
+          <button type="button" class="btn-ghost" id="pdfq-nenhuma">Limpar</button>
+        </div>
+        <div class="pdfq-abas">${abasHTML}</div>` : `<p style="font-size:13px; color:var(--text-secondary); margin:0;">Nenhuma questão na tela para exportar.</p>`}
     </div>
     <div class="modal-field">
       <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
-        <input type="radio" name="pdfq-escopo" value="materia"> Todos os assuntos desta matéria
+        <input type="radio" name="pdfq-escopo" value="materia"> Todos os assuntos desta matéria (ignora as abas)
       </label>
     </div>
     <div class="modal-field">
@@ -4259,6 +5871,18 @@ function abrirModalExportarPdfQuestoes(assuntoId) {
     </div>
   `);
 
+  const checks = () => Array.from(document.querySelectorAll(".pdfq-aba-check"));
+  const boxAbas = document.getElementById("pdfq-abas-box");
+  const atualizarEscopo = () => {
+    const ehAssunto = document.querySelector('input[name="pdfq-escopo"]:checked').value === "assunto";
+    boxAbas.classList.toggle("desativado", !ehAssunto);
+  };
+  document.querySelectorAll('input[name="pdfq-escopo"]').forEach(r => r.addEventListener("change", atualizarEscopo));
+  const btnTodas = document.getElementById("pdfq-todas");
+  if (btnTodas) btnTodas.addEventListener("click", () => checks().forEach(c => { c.checked = true; }));
+  const btnNenhuma = document.getElementById("pdfq-nenhuma");
+  if (btnNenhuma) btnNenhuma.addEventListener("click", () => checks().forEach(c => { c.checked = false; }));
+
   document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
   document.getElementById("btn-gerar-pdfq").addEventListener("click", async (e) => {
     const btn = e.currentTarget;
@@ -4266,6 +5890,21 @@ function abrirModalExportarPdfQuestoes(assuntoId) {
     const escopo = document.querySelector('input[name="pdfq-escopo"]:checked').value;
     const incluirTexto = document.getElementById("pdfq-texto").checked;
     const umaPorPagina = document.getElementById("pdfq-pagina").checked;
+
+    let selecao = null, descAbas = "", sufixoAbas = "";
+    if (escopo === "assunto") {
+      const abas = checks().filter(c => c.checked).map(c => parseInt(c.value, 10)).sort((a, b) => a - b);
+      if (!abas.length) {
+        status.hidden = false;
+        status.textContent = "Marque pelo menos uma aba para exportar.";
+        return;
+      }
+      selecao = [];
+      abas.forEach(p => selecao.push(...tela.slice((p - 1) * QUESTOES_POR_PAGINA, p * QUESTOES_POR_PAGINA)));
+      descAbas = (abas.length === 1 ? "Aba " : "Abas ") + abas.join(", ");
+      sufixoAbas = (abas.length === 1 ? "aba" : "abas") + abas.join("-");
+    }
+
     btn.disabled = true;
     status.hidden = false;
     status.textContent = "Preparando o PDF (precisa de internet na primeira vez)...";
@@ -4273,7 +5912,7 @@ function abrirModalExportarPdfQuestoes(assuntoId) {
       let r;
       try {
         r = await gerarPdfQuestoes({
-          assuntoId, escopo, incluirTexto, umaPorPagina,
+          assuntoId, escopo, incluirTexto, umaPorPagina, selecao, descAbas, sufixoAbas,
           onProgresso: (n) => { status.textContent = `Processando questão ${n}...`; },
         });
       } catch (err) {
@@ -4302,7 +5941,7 @@ function abrirModalExportarPdfQuestoes(assuntoId) {
       showToast(`PDF gerado com ${r.quantidade} questão${r.quantidade === 1 ? "" : "ões"} 📄`);
     } catch (err) {
       console.error("Erro ao exportar PDF das questões:", err);
-      status.textContent = "Erro ao gerar o PDF. Se forem muitas imagens, tente por assunto. Veja o console (F12).";
+      status.textContent = "Erro ao gerar o PDF. Se forem muitas imagens, exporte menos abas por vez. Veja o console (F12).";
       btn.disabled = false;
     }
   });
@@ -4592,7 +6231,7 @@ function confirmarExcluirMateria(materiaId) {
   openModal(`
     <h3 class="modal-title">Excluir "${escapeHTML(materia.nome)}"?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Isso apaga os assuntos dessa matéria, com todos os PDFs, questões, flashcards e anotações, além dos tópicos do checklist.
+      Isso apaga os assuntos dessa matéria, com todos os PDFs, questões e flashcards, além dos tópicos do checklist.
       Essa ação não pode ser desfeita.
     </p>
     <div class="modal-actions">
@@ -4621,7 +6260,7 @@ function confirmarExcluirConcurso(concursoId) {
   openModal(`
     <h3 class="modal-title">Excluir o roteiro "${escapeHTML(c.nome)}"?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Todas as matérias, assuntos, PDFs, questões, flashcards, anotações, tópicos do checklist e o cronograma
+      Todas as matérias, assuntos, PDFs, questões, flashcards, tópicos do checklist e o cronograma
       <b>deste roteiro</b> serão apagados. Os outros roteiros não são afetados. Essa ação não pode ser desfeita.
     </p>
     <div class="modal-actions">
@@ -4632,7 +6271,9 @@ function confirmarExcluirConcurso(concursoId) {
   document.getElementById("btn-cancel-modal").addEventListener("click", abrirModalGerenciarConcurso);
   document.getElementById("btn-confirm-delete").addEventListener("click", async () => {
     for (const m of c.materias) await apagarDadosDaMateria(m.id);
+    for (const r of await dbGetAll("agenda")) if (r.concursoId === c.id) await dbDelete("agenda", r.id);
     await dbDelete("concursos", c.id);
+    agendaCache = null;
     state.currentConcursoId = null;
     await carregarConcursos();
     closeModal();
@@ -4648,6 +6289,15 @@ async function apagarDadosDaMateria(materiaId) {
 
   const topicos = await dbGetAll("topicos", "materiaId", materiaId);
   for (const t of topicos) await dbDelete("topicos", t.id);
+
+  // tira a matéria do calendário (agenda)
+  const agendaTodos = await dbGetAll("agenda");
+  for (const r of agendaTodos) {
+    const restantes = (r.itens || []).filter(i => i.materiaId !== materiaId);
+    if (restantes.length === (r.itens || []).length) continue;
+    if (restantes.length > 0) await dbPut("agenda", { ...r, itens: restantes });
+    else await dbDelete("agenda", r.id);
+  }
 
   const cronograma = await dbGetAll("cronograma");
   for (const dia of cronograma) {

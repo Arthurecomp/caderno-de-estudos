@@ -12,7 +12,7 @@
    - Para forçar a atualização do cache em todos os aparelhos, aumente CACHE_VERSION.
    ========================================================================== */
 
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v9";
 const APP_CACHE = "caderno-app-" + CACHE_VERSION;
 const CDN_CACHE = "caderno-cdn-" + CACHE_VERSION;
 

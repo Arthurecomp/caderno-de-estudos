@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Caderno de Estudos — Concursos</title>
-<meta name="description" content="Caderno de estudos para concursos: materiais, questões, flashcards e anotações, 100% offline.">
+<meta name="description" content="Caderno de estudos para concursos: materiais, questões e flashcards, 100% offline.">
 
 <!-- ===== PWA ===== -->
 <link rel="manifest" href="manifest.json">
@@ -33,11 +33,12 @@
   </div>
 
   <div class="header-right">
+    <button id="btn-calendario" class="btn-icon" title="Plano da semana">📅</button>
     <button id="btn-roteiro" class="btn-icon" title="Roteiro de Estudos">🗺️</button>
     <button id="btn-anki" class="btn-icon" title="Exportar para o Anki (.apkg)">🗂️</button>
     <button id="btn-export" class="btn-icon" title="Exportar backup">⭳</button>
     <button id="btn-import" class="btn-icon" title="Importar backup">⭱</button>
-    <input type="file" id="import-file-input" accept="application/json" hidden>
+    <input type="file" id="import-file-input" accept=".zip,.json,application/zip,application/json" hidden>
     <button id="btn-theme" class="btn-icon" title="Alternar tema">🌙</button>
   </div>
 </header>
@@ -49,7 +50,13 @@
   <section id="view-home" class="view">
     <div id="concurso-bar" class="concurso-bar"></div>
     <div id="roteiro-banner" class="roteiro-banner"></div>
-    <p class="view-subtitle">Selecione uma matéria para começar a estudar.</p>
+    <div id="plano-hoje"></div>
+    <div class="view-header-row">
+      <p class="view-subtitle">Selecione uma matéria para começar a estudar.</p>
+      <div class="view-header-btns">
+        <button id="btn-desempenho-geral" class="btn-secondary">📊 Desempenho geral</button>
+      </div>
+    </div>
     <div id="materias-grid" class="cards-grid"></div>
   </section>
 
@@ -57,9 +64,17 @@
   <section id="view-materia" class="view" hidden>
     <div class="view-header-row">
       <p class="view-subtitle" id="materia-subtitle">Assuntos desta matéria</p>
-      <button id="btn-add-assunto" class="btn-primary">+ Adicionar assunto</button>
+      <div class="view-header-btns">
+        <button id="btn-desempenho" class="btn-secondary">📊 Desempenho</button>
+        <button id="btn-add-assunto" class="btn-primary">+ Adicionar assunto</button>
+      </div>
     </div>
     <div id="assuntos-list" class="assuntos-list"></div>
+  </section>
+
+  <!-- ---------- DESEMPENHO DA MATÉRIA ---------- -->
+  <section id="view-desempenho" class="view" hidden>
+    <div id="desempenho-container"></div>
   </section>
 
   <!-- ---------- TELA DO ASSUNTO: ABAS ---------- -->
@@ -68,7 +83,6 @@
       <button class="tab-btn active" data-tab="materiais">📚 Materiais</button>
       <button class="tab-btn" data-tab="questoes">❓ Questões</button>
       <button class="tab-btn" data-tab="flashcards">🃏 Flashcards</button>
-      <button class="tab-btn" data-tab="anotacoes">📝 Anotações</button>
     </div>
 
     <div class="tab-panel" id="tab-materiais" data-panel="materiais">
@@ -83,9 +97,6 @@
       <div id="flashcards-container"></div>
     </div>
 
-    <div class="tab-panel" id="tab-anotacoes" data-panel="anotacoes" hidden>
-      <div id="anotacoes-container"></div>
-    </div>
   </section>
 
   <!-- ---------- ROTEIRO DE ESTUDOS: RESUMO, CRONOGRAMA E CHECKLIST ---------- -->
@@ -93,19 +104,7 @@
 
     <div id="roteiro-resumo" class="roteiro-resumo"></div>
 
-    <div class="roteiro-secao">
-      <h3 class="roteiro-secao-titulo">📅 Sugestão de hoje</h3>
-      <div id="roteiro-sugestao"></div>
-    </div>
-
-    <div class="roteiro-secao">
-      <div class="view-header-row">
-        <h3 class="roteiro-secao-titulo">🗓️ Cronograma semanal</h3>
-        <button id="btn-limpar-cronograma" class="btn-secondary">Limpar cronograma</button>
-      </div>
-      <p class="view-subtitle" style="margin-bottom:14px;">Toque nas matérias de cada dia para montar sua rotina de estudos.</p>
-      <div id="cronograma-grid" class="cronograma-grid"></div>
-    </div>
+    <div id="plano-semana" class="roteiro-secao"></div>
 
     <div class="roteiro-secao">
       <h3 class="roteiro-secao-titulo">✅ Checklist do edital</h3>
@@ -113,6 +112,11 @@
       <div id="checklist-container"></div>
     </div>
 
+  </section>
+
+  <!-- ---------- CALENDÁRIO DE ESTUDOS ---------- -->
+  <section id="view-calendario" class="view" hidden>
+    <div id="calendario-container"></div>
   </section>
 
   <!-- ---------- RESULTADOS DE PESQUISA ---------- -->
